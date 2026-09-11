@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import io
+import re
 from datetime import datetime
 import calendar
 import altair as alt
@@ -39,6 +41,50 @@ RESOLVED_STATUSES = ["Resolved", "Closed / Complied"]
 # HELPER FUNCTIONS & DATA LOADING
 # ==========================================
 
+def norm_key(value):
+    """Normalise a lookup key: NBSP -> space, collapse whitespace, strip, lowercase.
+    Makes mapping immune to casing and stray-whitespace differences between the
+    Google Sheet and the ticket export."""
+    s = str(value).replace('\u00a0', ' ').replace('\u200b', '')
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s.lower()
+
+def build_map_from_sheet(url, sheet_label, key_col=None, val_col=None):
+    """Read a 2-column mapping sheet into {normalised_key: value}.
+    key_col/val_col are header names; when given they win over column position,
+    so the sheet can be stored in either order. Falls back to col 0 -> col 1.
+    Raises a clear message instead of silently returning an empty map."""
+    sheet_df = pd.read_csv(url)
+    if sheet_df.empty:
+        st.error(f"⚠️ {sheet_label}: sheet loaded but is empty.")
+        return {}
+    if len(sheet_df.columns) < 2:
+        # Usually means the sheet is no longer publicly viewable and Google
+        # returned an HTML sign-in page instead of CSV.
+        st.error(
+            f"⚠️ {sheet_label}: expected at least 2 columns, got "
+            f"{len(sheet_df.columns)} ({list(sheet_df.columns)[:3]}). "
+            "Check that the sheet is shared as 'Anyone with the link - Viewer'."
+        )
+        return {}
+    sheet_df.columns = [str(c).strip() for c in sheet_df.columns]
+    # Resolve which column is the lookup key and which is the returned value.
+    if key_col and val_col and key_col in sheet_df.columns and val_col in sheet_df.columns:
+        key_series, val_series = sheet_df[key_col], sheet_df[val_col]
+    else:
+        if key_col or val_col:
+            st.warning(
+                f"⚠️ {sheet_label}: expected headers '{key_col}' and '{val_col}' but found "
+                f"{list(sheet_df.columns)[:4]}. Falling back to column order (A -> B)."
+            )
+        key_series, val_series = sheet_df.iloc[:, 0], sheet_df.iloc[:, 1]
+    keys = key_series.map(norm_key)
+    vals = val_series.astype(str).str.strip()
+    pairs = {k: v for k, v in zip(keys, vals) if k and k not in ('nan', 'none') and v and v != 'nan'}
+    if not pairs:
+        st.error(f"⚠️ {sheet_label}: no usable rows found in the first two columns.")
+    return pairs
+
 @st.cache_data(ttl=600)
 def load_dynamic_mappings():
     """Fetches Google Sheets for Categories and Surveyors."""
@@ -47,17 +93,17 @@ def load_dynamic_mappings():
     
     # 1. Subcategories
     try:
-        cat_df = pd.read_csv(SUBCAT_MAPPING_URL)
-        if not cat_df.empty and len(cat_df.columns) >= 2:
-            cat_map = dict(zip(cat_df.iloc[:, 0].astype(str).str.strip(), cat_df.iloc[:, 1].astype(str).str.strip()))
+        # Sheet is stored Category (col A) -> Subcategory (col B); we need the reverse.
+        cat_map = build_map_from_sheet(
+            SUBCAT_MAPPING_URL, "Subcategory Mapping Sheet",
+            key_col="Subcategory", val_col="Category"
+        )
     except Exception as e:
         st.error(f"⚠️ Could not load Subcategory Mapping Sheet. Error: {e}")
 
     # 2. Surveyors
     try:
-        surv_df = pd.read_csv(SURVEYOR_LIST_URL)
-        if not surv_df.empty and len(surv_df.columns) >= 2:
-            surv_map = dict(zip(surv_df.iloc[:, 0].astype(str).str.strip(), surv_df.iloc[:, 1].astype(str).str.strip()))
+        surv_map = build_map_from_sheet(SURVEYOR_LIST_URL, "Surveyor Mapping Sheet")
     except Exception as e:
         st.error(f"⚠️ Could not load Surveyor Mapping Sheet. Error: {e}")
         
@@ -73,10 +119,10 @@ def load_officer_roster():
         combined_roster = pd.concat([civil_df, san_df], ignore_index=True)
         
         if 'Officer Name' in combined_roster.columns and 'Reporting Manager' in combined_roster.columns:
-            combined_roster['Officer Name'] = combined_roster['Officer Name'].astype(str).str.strip()
+            combined_roster['Officer Key'] = combined_roster['Officer Name'].map(norm_key)
             combined_roster['Reporting Manager'] = combined_roster['Reporting Manager'].astype(str).str.strip()
-            # Create a dictionary to map Ground Officer -> Manager
-            return dict(zip(combined_roster['Officer Name'], combined_roster['Reporting Manager']))
+            # Create a dictionary to map Ground Officer -> Manager (normalised keys)
+            return dict(zip(combined_roster['Officer Key'], combined_roster['Reporting Manager']))
     except Exception as e:
         st.error(f"⚠️ Could not load Officer Roster Sheets. Error: {e}")
         
@@ -112,19 +158,35 @@ def process_data(df):
     cat_map, surv_map = load_dynamic_mappings()
     officer_map = load_officer_roster()
     
-    # Clean and map categories
+    # Clean and map categories (match on normalised keys)
     df['Subcategory_Clean'] = df[COL_SUBCATEGORY].astype(str).str.strip()
-    df['MainCategory'] = df['Subcategory_Clean'].map(cat_map).fillna("Others")
+    df['Subcategory_Key'] = df[COL_SUBCATEGORY].map(norm_key)
+    df['MainCategory'] = df['Subcategory_Key'].map(cat_map).fillna("Others")
+    
+    # Diagnostics: surface subcategories that found no match in the mapping sheet
+    unmapped = df.loc[df['MainCategory'] == "Others", 'Subcategory_Clean']
+    if not cat_map:
+        st.error(
+            "❌ Subcategory mapping is empty - every ticket has fallen into 'Others'. "
+            "Fix the mapping sheet access/format above, then reload."
+        )
+    elif not unmapped.empty:
+        with st.expander(f"⚠️ {unmapped.nunique()} subcategory value(s) fell into 'Others' ({len(unmapped)} tickets)"):
+            st.caption("These exact values are missing from column A of the Subcategory Mapping Sheet:")
+            st.dataframe(
+                unmapped.value_counts().rename_axis('Subcategory').reset_index(name='Tickets'),
+                use_container_width=True
+            )
     
     # Map Surveyors (Apply rationalized names, mark others as "Ignored")
     if COL_SURVEYOR in df.columns:
         df['Raw_Surveyor'] = df[COL_SURVEYOR].astype(str).str.strip()
-        df['Rationalised_Surveyor'] = df['Raw_Surveyor'].map(surv_map).fillna("IGNORED")
+        df['Rationalised_Surveyor'] = df[COL_SURVEYOR].map(norm_key).map(surv_map).fillna("IGNORED")
         
     # Map Officers (Assigned User -> Reporting Manager)
     if COL_ASSIGNED in df.columns:
         df['Ground Officer'] = df[COL_ASSIGNED].astype(str).str.strip()
-        df['Manager'] = df['Ground Officer'].map(officer_map).fillna("Unmapped Manager")
+        df['Manager'] = df[COL_ASSIGNED].map(norm_key).map(officer_map).fillna("Unmapped Manager")
     else:
         df['Ground Officer'] = "Unassigned"
         df['Manager'] = "Unmapped Manager"
@@ -144,9 +206,10 @@ def process_data(df):
     if COL_RESOLVED in df.columns:
         df[COL_RESOLVED] = pd.to_datetime(df[COL_RESOLVED], dayfirst=True, errors='coerce')
         df['ClosureTimeDays'] = (df[COL_RESOLVED] - df[COL_CREATED]).dt.days
-        df['ClosureTimeDays'] = df['ClosureTimeDays'].apply(lambda x: x if pd.notna(x) and x >= 0 else None)
+        # Mask invalid/negative durations with NaN (keeps the column float64, not object)
+        df['ClosureTimeDays'] = df['ClosureTimeDays'].where(df['ClosureTimeDays'] >= 0)
     else:
-        df['ClosureTimeDays'] = None
+        df['ClosureTimeDays'] = np.nan
         
     now = datetime.now()
     df['AgeDays'] = (now - df[COL_CREATED]).dt.days
@@ -180,10 +243,10 @@ def generate_pivot_summary(df, group_col, label_suffix="Total", show_avg_time=Fa
         summary['Avg Closure Time (Days)'] = df.groupby(group_col)['ClosureTimeDays'].mean().round(1)
 
     total_row_data = {col: summary[col].sum() for col in STATUS_COLUMNS + ['Unresolved Total', 'Resolved Total', 'Grand Total']}
-    total_row_data['% Closure'] = (total_row_data['Resolved Total'] / total_row_data['Grand Total'] * 100) if total_row_data['Grand Total'] > 0 else 0
+    total_row_data['% Closure'] = round((total_row_data['Resolved Total'] / total_row_data['Grand Total'] * 100), 1) if total_row_data['Grand Total'] > 0 else 0
     
     if show_avg_time and 'ClosureTimeDays' in df.columns:
-        total_row_data['Avg Closure Time (Days)'] = df['ClosureTimeDays'].mean().round(1)
+        total_row_data['Avg Closure Time (Days)'] = round(df['ClosureTimeDays'].mean(), 1)
     
     total_row = pd.DataFrame([total_row_data], index=[f'**{label_suffix}**'])
     
@@ -636,7 +699,7 @@ def main():
                                 
                                 monthly_avgs = closed_year_df.groupby('ResolvedMonth')['ClosureTimeDays'].mean().round(1)
                                 total_row_data = {calendar.month_abbr[m]: monthly_avgs.get(m, None) for m in range(1, 13)}
-                                total_row_data['Yearly Avg'] = closed_year_df['ClosureTimeDays'].mean().round(1)
+                                total_row_data['Yearly Avg'] = round(closed_year_df['ClosureTimeDays'].mean(), 1)
                                 
                                 st.dataframe(pd.concat([main_avg_pivot, pd.DataFrame([total_row_data], index=['**OVERALL AVG**'])]), use_container_width=True)
                                 
