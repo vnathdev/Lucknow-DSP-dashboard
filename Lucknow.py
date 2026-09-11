@@ -142,28 +142,31 @@ def generate_pivot_summary(df, group_col, label_suffix="Total", show_avg_time=Fa
     if df.empty: return pd.DataFrame()
     summary = df.groupby([group_col, 'StatusBucket']).size().unstack(fill_value=0)
     
-    required_cols = ['Open', 'Submit for Approval', 'Resolved', 'Closed / Complied']
-    for col in required_cols:
+    for col in STATUS_COLUMNS:
         if col not in summary.columns: summary[col] = 0
-    summary = summary[required_cols]
-    
-    summary['Grand Total'] = summary.sum(axis=1)
-    summary['% Closure'] = summary.apply(lambda row: ((row['Resolved'] + row['Closed / Complied']) / row['Grand Total'] * 100) if row['Grand Total'] > 0 else 0, axis=1).round(1)
+            
+    summary = summary[STATUS_COLUMNS] 
+    summary['Unresolved Total'] = summary[UNRESOLVED_STATUSES].sum(axis=1)
+    summary['Resolved Total'] = summary[RESOLVED_STATUSES].sum(axis=1)
+    summary['Grand Total'] = summary['Unresolved Total'] + summary['Resolved Total']
+    summary['% Closure'] = summary.apply(lambda r: (r['Resolved Total'] / r['Grand Total'] * 100) if r['Grand Total'] > 0 else 0, axis=1).round(1)
     
     if show_avg_time and 'ClosureTimeDays' in df.columns:
         summary['Avg Closure Time (Days)'] = df.groupby(group_col)['ClosureTimeDays'].mean().round(1)
 
-    total_row_data = {col: summary[col].sum() for col in required_cols}
-    total_grand = sum(total_row_data.values())
-    numerator = total_row_data['Resolved'] + total_row_data['Closed / Complied']
-    total_row_data['Grand Total'] = total_grand
-    total_row_data['% Closure'] = (numerator / total_grand * 100) if total_grand > 0 else 0
+    total_row_data = {col: summary[col].sum() for col in STATUS_COLUMNS + ['Unresolved Total', 'Resolved Total', 'Grand Total']}
+    total_row_data['% Closure'] = (total_row_data['Resolved Total'] / total_row_data['Grand Total'] * 100) if total_row_data['Grand Total'] > 0 else 0
     
     if show_avg_time and 'ClosureTimeDays' in df.columns:
-        total_row_data['Avg Closure Time (Days)'] = df['ClosureTimeDays'].mean().round(1)
+        avg_val = df['ClosureTimeDays'].mean()
+        total_row_data['Avg Closure Time (Days)'] = round(avg_val, 1) if pd.notna(avg_val) else None
     
     total_row = pd.DataFrame([total_row_data], index=[f'**{label_suffix}**'])
-    return pd.concat([summary, total_row])
+    
+    cols_order = STATUS_COLUMNS + ['Unresolved Total', 'Grand Total', '% Closure']
+    if show_avg_time and 'ClosureTimeDays' in df.columns: cols_order.append('Avg Closure Time (Days)')
+        
+    return pd.concat([summary, total_row])[cols_order]
 
 def generate_leaderboard_summary(df, group_cols, label_suffix="Total"):
     if df.empty: return pd.DataFrame()
