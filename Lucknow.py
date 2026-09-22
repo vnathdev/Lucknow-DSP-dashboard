@@ -615,87 +615,98 @@ def main():
                         }
                     )
 
-            # ==========================================
-            # OFFICER LEADERBOARD
+           # ==========================================
+            # OFFICER LEADERBOARD (DATA DUMP BASED)
             # ==========================================
             elif st.session_state.current_view == "Officer Leaderboard":
-                st.subheader("🏆 Officer Leaderboard & Pendency Tracking")
-                st.caption("Live mappings pulled from Google Sheets.")
+                st.subheader("🏆 Officer Leaderboard")
+                st.caption("Tracking performance directly mapped to the Assigned Officers in the data dump.")
                 
-                unresolved_df = df_processed[df_processed['StatusBucket'].isin(UNRESOLVED_STATUSES)].copy()
-                ignore_list = ['Unassigned', 'Unmapped Manager']
-                
-                valid_unresolved = unresolved_df[
-                    (~unresolved_df['Ground Officer'].isin(ignore_list)) & 
-                    (~unresolved_df['Manager'].isin(ignore_list))
-                ]
-                
-                # Split by Category dynamically
-                cat_tabs = st.tabs(main_categories)
-                
-                def draw_leaderboard(df_to_use, group_col, role_label):
-                    if df_to_use.empty:
-                        st.info(f"No unresolved tickets found for {role_label}s in this category.")
-                        return
-                        
-                    counts = df_to_use.groupby(group_col).size().reset_index(name='Total Unresolved Tickets')
-                    counts = counts.sort_values('Total Unresolved Tickets', ascending=True).reset_index(drop=True)
-                    counts.columns = [f"{role_label} Name", 'Total Unresolved Tickets']
-                        
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.success(f"🌟 Top 5 {role_label}s (Least Pendency)")
-                        top_5 = counts.head(5).copy()
-                        top_5.index = top_5.index + 1  
-                        st.dataframe(top_5, use_container_width=True)
-                            
-                    with c2:
-                        st.error(f"⚠️ Bottom 5 {role_label}s (Highest Pendency)")
-                        bottom_5 = counts.tail(5).sort_values('Total Unresolved Tickets', ascending=False).reset_index(drop=True)
-                        bottom_5.index = bottom_5.index + 1  
-                        st.dataframe(bottom_5, use_container_width=True)
-
-                for tab, cat in zip(cat_tabs, main_categories):
-                    with tab:
-                        cat_df = valid_unresolved[valid_unresolved['MainCategory'] == cat]
-                        st.markdown("##### 👷 Ground Officers")
-                        draw_leaderboard(cat_df, 'Ground Officer', 'Officer')
-                        st.markdown("<br>", unsafe_allow_html=True)
-                        st.markdown("##### 👔 Managers")
-                        draw_leaderboard(cat_df, 'Manager', 'Manager')
-                        
-                st.markdown("---")
-                st.markdown("### 🔍 Filtered Officer Pendency View")
-                
+                # --- 1. Dynamic Filters ---
                 f1, f2, f3 = st.columns(3)
-                with f1: f_cat = st.selectbox("Category", ["All"] + main_categories)
-                with f2: 
-                    if COL_ZONE in df_processed.columns:
-                        f_zone = st.selectbox("Zone", ["All"] + sorted(df_processed[COL_ZONE].dropna().unique().tolist()))
-                    else:
-                        f_zone = "All"
-                with f3: role_type = st.radio("Select Role to Inspect", ["Ground Officer", "Manager"], horizontal=True)
                 
-                filt_df = valid_unresolved.copy()
-                if f_cat != "All": filt_df = filt_df[filt_df['MainCategory'] == f_cat]
-                if f_zone != "All" and COL_ZONE in filt_df.columns: filt_df = filt_df[filt_df[COL_ZONE] == f_zone]
-                
-                target_col = 'Ground Officer' if role_type == "Ground Officer" else 'Manager'
-                
-                if not filt_df.empty:
-                    officer_list = ["All"] + sorted(filt_df[target_col].dropna().unique().tolist())
-                    f_officer = st.selectbox(f"Select Specific {role_type}", officer_list)
+                with f1: 
+                    f_cat = st.selectbox("Category", ["All"] + main_categories)
                     
-                    if f_officer != "All":
-                        filt_df = filt_df[filt_df[target_col] == f_officer]
+                with f2: 
+                    avail_zones = ["All"] + sorted(df_processed['Zone Name'].dropna().unique().tolist()) if 'Zone Name' in df_processed.columns else ["All"]
+                    f_zone = st.selectbox("Zone", avail_zones)
+                    
+                with f3: 
+                    if f_cat == "All":
+                        avail_subs = ["All"] + sorted(df_processed['Subcategory'].dropna().unique().tolist())
+                    else:
+                        avail_subs = ["All"] + sorted(df_processed[df_processed['MainCategory'] == f_cat]['Subcategory'].dropna().unique().tolist())
+                    f_sub = st.selectbox("Subcategory", avail_subs)
+                    
+                f4, f5 = st.columns(2)
+                
+                with f4:
+                    if 'Assigned User Designation' in df_processed.columns:
+                        avail_desig = sorted(df_processed['Assigned User Designation'].dropna().astype(str).unique().tolist())
+                    else:
+                        avail_desig = []
+                    f_desig = st.multiselect("Designation", avail_desig, default=avail_desig)
+                    
+                with f5:
+                    avail_status = sorted(df_processed['StatusBucket'].dropna().unique().tolist())
+                    f_status = st.multiselect("Status", avail_status, default=avail_status)
+                
+                # --- 2. Apply Filters ---
+                filt_df = df_processed.copy()
+                if f_cat != "All": 
+                    filt_df = filt_df[filt_df['MainCategory'] == f_cat]
+                if f_zone != "All" and 'Zone Name' in filt_df.columns: 
+                    filt_df = filt_df[filt_df['Zone Name'] == f_zone]
+                if f_sub != "All": 
+                    filt_df = filt_df[filt_df['Subcategory'] == f_sub]
+                if f_desig and 'Assigned User Designation' in filt_df.columns:
+                    filt_df = filt_df[filt_df['Assigned User Designation'].astype(str).isin(f_desig)]
+                if f_status:
+                    filt_df = filt_df[filt_df['StatusBucket'].isin(f_status)]
+                
+                # --- 3. Generate Leaderboard ---
+                if not filt_df.empty and (not avail_desig or f_desig) and f_status:
+                    group_cols = ['Assigned User Name']
+                    
+                    if 'Assigned User Designation' in filt_df.columns:
+                        filt_df['Assigned User Designation'] = filt_df['Assigned User Designation'].fillna('Unknown')
+                        group_cols.append('Assigned User Designation')
                         
-                    final_table = filt_df.groupby(target_col).size().reset_index(name='Total Unresolved Tickets')
-                    final_table = final_table.sort_values('Total Unresolved Tickets', ascending=False).reset_index(drop=True)
-                    final_table.columns = ['Officer Name', 'Total Unresolved Tickets']
-                    final_table.index = final_table.index + 1
-                    st.dataframe(final_table, use_container_width=True)
+                    # Group by Name (and Designation if it exists)
+                    officer_summary = filt_df.groupby(group_cols + ['StatusBucket']).size().unstack(fill_value=0)
+                    
+                    # Guarantee all baseline columns exist even if no tickets match the current selection
+                    for col in ['Open', 'Submit for Approval', 'Resolved', 'Closed / Complied']:
+                        if col not in officer_summary.columns:
+                            officer_summary[col] = 0
+                            
+                    # Calculate customized Pending and Closed buckets based on selected data
+                    officer_summary['Pending'] = officer_summary['Open'] + officer_summary['Submit for Approval']
+                    officer_summary['Closed'] = officer_summary['Resolved'] + officer_summary['Closed / Complied']
+                    officer_summary['Total'] = officer_summary['Pending'] + officer_summary['Closed']
+                    
+                    # Clean up the final display table
+                    officer_summary = officer_summary.reset_index()
+                    
+                    rename_dict = {'Assigned User Name': 'Officer Name'}
+                    display_cols = ['Officer Name']
+                    
+                    if 'Assigned User Designation' in officer_summary.columns:
+                        rename_dict['Assigned User Designation'] = 'Designation'
+                        display_cols.append('Designation')
+                        
+                    display_cols.extend(['Pending', 'Closed', 'Total'])
+                    
+                    officer_summary = officer_summary.rename(columns=rename_dict)
+                    officer_summary = officer_summary[display_cols].sort_values(by='Total', ascending=False).reset_index(drop=True)
+                    
+                    # 1-based indexing for ranking
+                    officer_summary.index = officer_summary.index + 1
+                    
+                    st.dataframe(officer_summary, use_container_width=True)
                 else:
-                    st.info("No unresolved tickets found matching those filters.")
+                    st.info("No tickets found matching the selected filters.")
 
             elif st.session_state.current_view == "Zone-wise Drill-Down":
                 st.subheader("🗺️ Zone-wise Drill-Down")
