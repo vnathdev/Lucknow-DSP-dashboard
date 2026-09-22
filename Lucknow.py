@@ -550,20 +550,27 @@ def main():
                 st.caption("Use the filters below to pull up specific raw tickets based on the summary numbers above.")
                 
                 with st.expander("Click to Open Ticket Inspector", expanded=False):
-                    f1, f2, f3 = st.columns(3)
+                    f1, f2, f3, f4 = st.columns(4)
                     
                     with f1:
                         filter_cat = st.selectbox("1. Select Main Category", ["All"] + main_categories)
                     
                     with f2:
                         if filter_cat == "All":
-                            available_subs = ["All"] + sorted(df_processed['Subcategory_Clean'].dropna().unique().tolist())
+                            avail_subs = ["All"] + sorted(df_processed['Subcategory_Clean'].dropna().unique().tolist())
                         else:
-                            available_subs = ["All"] + sorted(df_processed[df_processed['MainCategory'] == filter_cat]['Subcategory_Clean'].dropna().unique().tolist())
-                        filter_sub = st.selectbox("2. Select Subcategory", available_subs)
+                            avail_subs = ["All"] + sorted(df_processed[df_processed['MainCategory'] == filter_cat]['Subcategory_Clean'].dropna().unique().tolist())
+                        filter_sub = st.selectbox("2. Select Subcategory", avail_subs)
                         
                     with f3:
                         filter_status = st.selectbox("3. Select Status", ["All"] + STATUS_COLUMNS)
+
+                    with f4:
+                        if 'Assigned User Designation' in df_processed.columns:
+                            avail_desig = ["All"] + sorted(df_processed['Assigned User Designation'].dropna().astype(str).unique().tolist())
+                        else:
+                            avail_desig = ["All"]
+                        filter_desig = st.selectbox("4. Select Designation", avail_desig)
                         
                     st.markdown("<br>", unsafe_allow_html=True)
                     
@@ -574,7 +581,7 @@ def main():
                         if use_date:
                             min_date = df_processed[COL_CREATED].min().date()
                             max_date = df_processed[COL_CREATED].max().date()
-                            filter_dates = st.date_input("4. Select Date Range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
+                            filter_dates = st.date_input("5. Select Date Range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
                         
                     deep_dive_df = df_processed.copy()
                     if filter_cat != "All":
@@ -583,6 +590,8 @@ def main():
                         deep_dive_df = deep_dive_df[deep_dive_df['Subcategory_Clean'] == filter_sub]
                     if filter_status != "All":
                         deep_dive_df = deep_dive_df[deep_dive_df['StatusBucket'] == filter_status]
+                    if filter_desig != "All" and 'Assigned User Designation' in deep_dive_df.columns:
+                        deep_dive_df = deep_dive_df[deep_dive_df['Assigned User Designation'] == filter_desig]
                         
                     if use_date and len(filter_dates) == 2:
                         start_d, end_d = filter_dates
@@ -590,13 +599,17 @@ def main():
                         
                     st.markdown(f"**Found {len(deep_dive_df)} matching tickets:**")
                     
-                    raw_cols = [COL_TICKET_ID, COL_ZONE, COL_WARD, COL_CREATED, 'AgeDays', COL_BEFORE_IMG, COL_AFTER_IMG]
+                    # Output columns structurally ordered
+                    raw_cols = [COL_TICKET_ID, 'Subcategory_Clean', COL_ASSIGNED, 'Assigned User Designation', COL_ZONE, COL_WARD, COL_CREATED, 'AgeDays', COL_BEFORE_IMG, COL_AFTER_IMG]
                     display_cols = [c for c in raw_cols if c in deep_dive_df.columns]
                     
                     out_df = deep_dive_df[display_cols].copy()
                     
                     rename_mapping = {
                         COL_TICKET_ID: "Ticket Number",
+                        'Subcategory_Clean': "Subcategory",
+                        COL_ASSIGNED: "Officer Name",
+                        'Assigned User Designation': "Designation",
                         COL_ZONE: "Zone",
                         COL_WARD: "Ward",
                         COL_CREATED: "Raised Date",
@@ -755,7 +768,7 @@ def main():
                 
                 # --- 2. Ticket Inspector ---
                 with st.expander("Click to Open Pendency Inspector", expanded=False):
-                    f1, f2, f3 = st.columns(3)
+                    f1, f2, f3, f4 = st.columns(4)
                     
                     with f1:
                         filter_cat_age = st.selectbox("1. Category", ["All"] + main_categories, key="insp_cat_age")
@@ -770,6 +783,13 @@ def main():
                     with f3:
                         age_buckets = ['< 1 Month', '1-6 Months', '6-12 Months', '> 1 Year']
                         filter_age_bucket = st.selectbox("3. Age Bucket", ["All"] + age_buckets)
+
+                    with f4:
+                        if 'Assigned User Designation' in df_processed.columns:
+                            avail_desig_age = ["All"] + sorted(df_processed['Assigned User Designation'].dropna().astype(str).unique().tolist())
+                        else:
+                            avail_desig_age = ["All"]
+                        filter_desig_age = st.selectbox("4. Designation", avail_desig_age, key="insp_desig_age")
                         
                     insp_age_df = df_processed[df_processed['StatusBucket'].isin(UNRESOLVED_STATUSES)].copy()
                     
@@ -779,16 +799,21 @@ def main():
                         insp_age_df = insp_age_df[insp_age_df['Subcategory_Clean'] == filter_sub_age]
                     if filter_age_bucket != "All":
                         insp_age_df = insp_age_df[insp_age_df['AgeBucket'] == filter_age_bucket]
+                    if filter_desig_age != "All" and 'Assigned User Designation' in insp_age_df.columns:
+                        insp_age_df = insp_age_df[insp_age_df['Assigned User Designation'] == filter_desig_age]
                         
                     st.markdown(f"**Found {len(insp_age_df)} pending tickets:**")
                     
-                    raw_cols_age = [COL_TICKET_ID, COL_CREATED, COL_ZONE, COL_WARD, 'Ground Officer', 'Manager', COL_BEFORE_IMG]
+                    raw_cols_age = [COL_TICKET_ID, 'Subcategory_Clean', COL_ASSIGNED, 'Assigned User Designation', COL_CREATED, COL_ZONE, COL_WARD, COL_BEFORE_IMG]
                     display_cols_age = [c for c in raw_cols_age if c in insp_age_df.columns]
                     
                     out_age_df = insp_age_df[display_cols_age].copy()
                     
                     rename_mapping_age = {
                         COL_TICKET_ID: "Ticket Number",
+                        'Subcategory_Clean': "Subcategory",
+                        COL_ASSIGNED: "Officer Name",
+                        'Assigned User Designation': "Designation",
                         COL_CREATED: "Raised Date",
                         COL_ZONE: "Zone",
                         COL_WARD: "Ward",
