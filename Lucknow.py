@@ -31,6 +31,7 @@ CIVIL_OFFICER_URL = "https://docs.google.com/spreadsheets/d/1R7NnhOQNibQtAI6OnUj
 SANITATION_OFFICER_URL = "https://docs.google.com/spreadsheets/d/1R7NnhOQNibQtAI6OnUjvg8BtZ-SZGRKcIHi0f_qRM68/export?format=csv&gid=1074591996"
 SUBCAT_MAPPING_URL = "https://docs.google.com/spreadsheets/d/1R7NnhOQNibQtAI6OnUjvg8BtZ-SZGRKcIHi0f_qRM68/export?format=csv&gid=2005007155"
 SURVEYOR_LIST_URL = "https://docs.google.com/spreadsheets/d/1R7NnhOQNibQtAI6OnUjvg8BtZ-SZGRKcIHi0f_qRM68/export?format=csv&gid=1801847585"
+QC_SHEET_URL = "https://docs.google.com/spreadsheets/d/1Rl_rvPbBrpr86fsg9cpIbPEbm-GyZUBy22xHmMnvK-U/edit?gid=1455880256#gid=1455880256"
 
 # --- Status Buckets for Lucknow ---
 STATUS_COLUMNS = ["Open", "Submit for Approval", "Resolved", "Closed / Complied"]
@@ -40,6 +41,20 @@ RESOLVED_STATUSES = ["Resolved", "Closed / Complied"]
 # ==========================================
 # HELPER FUNCTIONS & DATA LOADING
 # ==========================================
+
+def get_google_sheet_url(url):
+    try:
+        if "docs.google.com/spreadsheets" not in url: return None
+        # If it's already a CSV export link, just return it
+        if "/export?format=csv" in url: return url
+        parts = url.split('/')
+        if 'd' in parts:
+            d_index = parts.index('d')
+            sheet_id = parts[d_index + 1]
+            return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+        return None
+    except:
+        return None
 
 def norm_key(value):
     """Normalise a lookup key: NBSP -> space, collapse whitespace, strip, lowercase.
@@ -434,7 +449,8 @@ def main():
         "Custom Date Range Analysis",
         "Quarterly Performance (FY)",
         "Surveyor Performance",
-        "Summary Report"
+        "Summary Report",
+	"Quality Check Status"
     ]
     
     for view in views:
@@ -1338,6 +1354,172 @@ def main():
                         else:
                             st.warning("No ward data available for this zone.")
 
+	    # ==========================================
+            # QUALITY CHECK STATUS
+            # ==========================================
+            elif st.session_state.current_view == "Quality Check Status":
+                st.subheader("✅ Quality Check Status")
+                st.caption("Overview of L1 and L2 quality checks for Raised and Resolved tickets directly from the QC Sheet.")
+                
+                qc_url = get_google_sheet_url(QC_SHEET_URL)
+                
+                if not qc_url or "PASTE_YOUR" in qc_url:
+                    st.warning("⚠️ Please paste a valid Quality Check Google Sheet URL into the `QC_SHEET_URL` variable at the top of the code.")
+                else:
+                    try:
+                        # Load the QC data
+                        qc_df = pd.read_csv(qc_url)
+                        
+                        # Ensure the sheet has up to Column W (Index 22)
+                        if len(qc_df.columns) >= 23:
+                            # Map columns directly by Excel index (A=0 ... R=17, S=18, T=19, U=20, V=21, W=22)
+                            r_l1_col = qc_df.columns[17]  # Column R
+                            r_l2_col = qc_df.columns[18]  # Column S
+                            res_l1_col = qc_df.columns[19] # Column T
+                            res_l2_col = qc_df.columns[20] # Column U
+                            res_l1_rsn = qc_df.columns[21] # Column V
+                            res_l2_rsn = qc_df.columns[22] # Column W
+                            
+                            # --- PRE-COMPUTE ALL COUNTS ---
+                            r_l1_counts = qc_df[r_l1_col].value_counts().reset_index()
+                            r_l1_counts.columns = ['Status', 'Count']
+                            r_l1_counts['Level'] = 'L1 (Col R)'
+                            
+                            r_l2_counts = qc_df[r_l2_col].value_counts().reset_index()
+                            r_l2_counts.columns = ['Status', 'Count']
+                            r_l2_counts['Level'] = 'L2 (Col S)'
+                            
+                            # Filter out "Not Evaluated" (case-insensitive) for Resolved tickets
+                            res_l1_clean = qc_df[~qc_df[res_l1_col].astype(str).str.lower().str.contains('not evaluated', na=False)]
+                            res_l1_counts = res_l1_clean[res_l1_col].value_counts().reset_index()
+                            res_l1_counts.columns = ['Status', 'Count']
+                            res_l1_counts['Level'] = 'L1 (Col T)'
+                            
+                            res_l2_clean = qc_df[~qc_df[res_l2_col].astype(str).str.lower().str.contains('not evaluated', na=False)]
+                            res_l2_counts = res_l2_clean[res_l2_col].value_counts().reset_index()
+                            res_l2_counts.columns = ['Status', 'Count']
+                            res_l2_counts['Level'] = 'L2 (Col U)'
+
+                            # --- 1. INDIVIDUAL DISTRIBUTION PIE CHARTS ---
+                            st.markdown("### 📊 Overall L1 vs L2 Distribution")
+                            
+                            chart_configs = [
+                                ("Raised Tickets (L1)", r_l1_counts),
+                                ("Raised Tickets (L2)", r_l2_counts),
+                                ("Resolved Tickets (L1)", res_l1_counts),
+                                ("Resolved Tickets (L2)", res_l2_counts)
+                            ]
+                            
+                            pie_cols = st.columns(4)
+                            
+                            for idx, (title, df_c) in enumerate(chart_configs):
+                                with pie_cols[idx]:
+                                    st.markdown(f"<p style='text-align: center; font-weight: bold;'>{title}</p>", unsafe_allow_html=True)
+                                    if not df_c.empty and df_c['Count'].sum() > 0:
+                                        total_val = df_c['Count'].sum()
+                                        plot_df = df_c.copy()
+                                        plot_df['%'] = (plot_df['Count'] / total_val * 100).round(1)
+                                        
+                                        pie = alt.Chart(plot_df).mark_arc(innerRadius=40).encode(
+                                            theta=alt.Theta(field="Count", type="quantitative"),
+                                            color=alt.Color(
+                                                field="Status", 
+                                                type="nominal", 
+                                                legend=alt.Legend(
+                                                    orient="bottom", 
+                                                    title=None,
+                                                    labelFontSize=10, 
+                                                    symbolSize=60,
+                                                    labelLimit=0
+                                                )
+                                            ),
+                                            tooltip=['Status', 'Count', '%']
+                                        ).properties(height=320)
+                                        
+                                        st.altair_chart(pie, use_container_width=True)
+                                        st.markdown(f"<p style='text-align: center; font-weight: bold; margin-top: -15px;'>Total: {total_val}</p>", unsafe_allow_html=True)
+                                    else:
+                                        st.info("No data available.")
+                                
+                            st.markdown("---")
+                            
+                            # --- 2. RAISED TICKETS QC ---
+                            st.markdown("### 🚨 Raised Tickets Quality Check")
+                            raised_chart_df = pd.concat([r_l1_counts, r_l2_counts]).dropna()
+                            
+                            # Full-width bar chart
+                            if not raised_chart_df.empty:
+                                raised_chart = alt.Chart(raised_chart_df).mark_bar().encode(
+                                    x=alt.X('Status:N', title='Quality Status', axis=alt.Axis(labelAngle=0)),
+                                    y=alt.Y('Count:Q', title='Tickets'),
+                                    color=alt.Color('Level:N', legend=alt.Legend(title="Check Level", labelFontSize=11)),
+                                    xOffset='Level:N'
+                                ).properties(height=400)
+                                st.altair_chart(raised_chart, use_container_width=True)
+                            else:
+                                st.info("No data found for Raised Quality Checks.")
+                                
+                            # Tables beneath chart
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                st.markdown("**L1 Raised Checks**")
+                                st.dataframe(r_l1_counts[['Status', 'Count']], use_container_width=True, hide_index=True)
+                            with c2:
+                                st.markdown("**L2 Raised Checks**")
+                                st.dataframe(r_l2_counts[['Status', 'Count']], use_container_width=True, hide_index=True)
+                                
+                            st.markdown("---")
+                            
+                            # --- 3. RESOLVED TICKETS QC ---
+                            st.markdown("### 🏁 Resolved Tickets Quality Check")
+                            res_chart_df = pd.concat([res_l1_counts, res_l2_counts]).dropna()
+                            
+                            # Full-width bar chart
+                            if not res_chart_df.empty:
+                                res_chart = alt.Chart(res_chart_df).mark_bar().encode(
+                                    x=alt.X('Status:N', title='Quality Status', axis=alt.Axis(labelAngle=0)),
+                                    y=alt.Y('Count:Q', title='Tickets'),
+                                    color=alt.Color('Level:N', legend=alt.Legend(title="Check Level", labelFontSize=11)),
+                                    xOffset='Level:N'
+                                ).properties(height=400)
+                                st.altair_chart(res_chart, use_container_width=True)
+                            else:
+                                st.info("No data found for Resolved Quality Checks.")
+                                
+                            # Tables beneath chart
+                            c3, c4 = st.columns(2)
+                            with c3:
+                                st.markdown("**L1 Resolved Checks**")
+                                st.dataframe(res_l1_counts[['Status', 'Count']], use_container_width=True, hide_index=True)
+                            with c4:
+                                st.markdown("**L2 Resolved Checks**")
+                                st.dataframe(res_l2_counts[['Status', 'Count']], use_container_width=True, hide_index=True)
+                                
+                            st.markdown("##### 📝 Reasons for Resolved Quality Checks")
+                            c5, c6 = st.columns(2)
+                            with c5:
+                                l1_reasons = qc_df[res_l1_rsn].value_counts().reset_index()
+                                l1_reasons.columns = ['L1 Reason (Col V)', 'Count']
+                                st.dataframe(l1_reasons, use_container_width=True, hide_index=True)
+                            with c6:
+                                l2_reasons = qc_df[res_l2_rsn].value_counts().reset_index()
+                                l2_reasons.columns = ['L2 Reason (Col W)', 'Count']
+                                st.dataframe(l2_reasons, use_container_width=True, hide_index=True)
+
+                        else:
+                            st.error("⚠️ The linked Google Sheet does not have enough columns. The tool requires data extending at least up to Column W (23 columns).")
+                            
+                    except Exception as e:
+                        st.error(f"❌ Could not load or parse the Quality Check sheet: {e}")
+                            
+                    except Exception as e:
+                        st.error(f"❌ Could not load or parse the Quality Check sheet: {e}")
+                            
+                    except Exception as e:
+                        st.error(f"❌ Could not load or parse the Quality Check sheet: {e}")
+                            
+                    except Exception as e:
+                        st.error(f"❌ Could not load or parse the Quality Check sheet: {e}")
         except Exception as e:
             st.error(f"❌ Error: {str(e)}")
             st.exception(e)
