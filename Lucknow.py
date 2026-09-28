@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import io
+import re
 from datetime import datetime
 import calendar
 import altair as alt
@@ -62,7 +63,8 @@ def load_dynamic_mappings():
     try:
         cat_df = pd.read_csv(SUBCAT_MAPPING_URL)
         if not cat_df.empty and len(cat_df.columns) >= 2:
-            cat_map = dict(zip(cat_df.iloc[:, 0].astype(str).str.strip(), cat_df.iloc[:, 1].astype(str).str.strip()))
+            # Swapped iloc[:, 1] (Subcategory) as the key and iloc[:, 0] (Main Category) as the value
+            cat_map = dict(zip(cat_df.iloc[:, 1].astype(str).str.strip(), cat_df.iloc[:, 0].astype(str).str.strip()))
     except Exception as e:
         st.error(f"⚠️ Could not load Subcategory Mapping Sheet. Error: {e}")
 
@@ -92,6 +94,140 @@ def display_with_fixed_footer(df, show_closure=True):
     st.dataframe(body, use_container_width=True, column_config=config)
     st.markdown("⬇️ **Grand Total**") 
     st.dataframe(total, use_container_width=True, column_config=config)
+
+def _natural_zone_key(label):
+    """Sort 'Zone 2' before 'Zone 10' instead of alphabetically."""
+    digits = re.findall(r'\d+', str(label))
+    return (int(digits[0]) if digits else 10**9, str(label))
+
+
+def _format_report_date(d):
+    """11 Sept 2026 - matches the printed report convention."""
+    abbr = d.strftime("%b")
+    if abbr == "Sep":
+        abbr = "Sept"
+    return f"{d.day} {abbr} {d.year}"
+
+
+def build_summary_tables(df, as_of_date=None):
+    """Returns (category_table, {category: zone_table}) in the printed report's shape.
+
+    'Closed' counts tickets whose status bucket is in RESOLVED_STATUSES.
+    """
+    data = df.copy()
+    if as_of_date is not None:
+        data = data[data[COL_CREATED].dt.date <= as_of_date]
+
+    data['_IsClosed'] = data['StatusBucket'].isin(RESOLVED_STATUSES)
+
+    def summarise(frame, group_col, label):
+        grouped = frame.groupby(group_col).agg(
+            Raised=('_IsClosed', 'size'),
+            Closed=('_IsClosed', 'sum')
+        ).reset_index()
+        grouped['Pending'] = grouped['Raised'] - grouped['Closed']
+        grouped['% Closure'] = (grouped['Closed'] / grouped['Raised'] * 100).where(grouped['Raised'] > 0, 0).round(2)
+        grouped = grouped.rename(columns={group_col: label})
+        return grouped
+
+    cat_table = summarise(data, 'MainCategory', 'Category')
+    cat_table = cat_table.sort_values('Raised', ascending=False).reset_index(drop=True)
+
+    zone_tables = {}
+    if COL_ZONE in data.columns:
+        for category in cat_table['Category']:
+            cat_rows = data[data['MainCategory'] == category]
+            zt = summarise(cat_rows, COL_ZONE, 'Zone')
+            zt = zt.sort_values('Zone', key=lambda s: s.map(_natural_zone_key)).reset_index(drop=True)
+            zone_tables[category] = zt
+
+    return cat_table, zone_tables
+
+
+def _add_total_row(table_df, first_col, label="Total"):
+    raised = int(table_df['Raised'].sum())
+    closed = int(table_df['Closed'].sum())
+    total = {
+        first_col: label,
+        'Raised': raised,
+        'Closed': closed,
+        'Pending': raised - closed,
+        '% Closure': round(closed / raised * 100, 2) if raised else 0.0
+    }
+    return pd.concat([table_df, pd.DataFrame([total])], ignore_index=True)
+
+
+def build_summary_pdf(cat_table, zone_tables, report_date, city_name="Lucknow Nagar Nigam"):
+    """Renders the DSP status report to PDF bytes in the standard printed layout."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=A4,
+        leftMargin=18 * mm, rightMargin=18 * mm, topMargin=16 * mm, bottomMargin=16 * mm,
+        title=f"{city_name} DSP Program Status"
+    )
+    styles = getSampleStyleSheet()
+    h_city = ParagraphStyle('City', parent=styles['Title'], fontSize=18, spaceAfter=2)
+    h_sub = ParagraphStyle('Sub', parent=styles['Title'], fontSize=13, spaceAfter=2)
+    h_date = ParagraphStyle('DateLine', parent=styles['Normal'], fontSize=10, alignment=1, spaceAfter=10)
+    h_sec = ParagraphStyle('Sec', parent=styles['Heading2'], fontSize=12, spaceBefore=10, spaceAfter=6)
+
+    def make_table(df_table, headers):
+        rows = [headers]
+        for _, r in df_table.iterrows():
+            rows.append([
+                str(r.iloc[0]),
+                f"{int(r['Raised']):,}",
+                f"{int(r['Closed']):,}",
+                f"{int(r['Pending']):,}",
+                f"{r['% Closure']:.2f}%"
+            ])
+        tbl = Table(rows, colWidths=[55 * mm] + [26 * mm] * 4, repeatRows=1, hAlign='LEFT')
+        tbl.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1F4E79')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+            ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#DCE6F1')),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#9BA7B4')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -2), [colors.white, colors.HexColor('#F4F6F8')]),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ]))
+        return tbl
+
+    story = [
+        Paragraph(city_name, h_city),
+        Paragraph("DSP Program Status", h_sub),
+        Paragraph(f"Date: {_format_report_date(report_date)}", h_date),
+        Paragraph("Dispersed sources ticket resolution status", h_sec),
+        make_table(_add_total_row(cat_table, 'Category'),
+                   ['Category', 'Tickets raised', 'Tickets closed', 'Tickets pending', '% closure']),
+        Spacer(1, 6),
+    ]
+
+    from reportlab.platypus import KeepTogether
+    for category, zt in zone_tables.items():
+        block = [
+            Paragraph(f"{category} Ticket status", h_sec),
+            make_table(_add_total_row(zt, 'Zone'),
+                       ['Zone', 'Raised', 'Closed', 'Pending', '% Closure']),
+            Spacer(1, 6),
+        ]
+        story.append(KeepTogether(block))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
 
 @st.cache_data
 def process_data(df):
@@ -225,6 +361,7 @@ def main():
         "Custom Date Range Analysis",
         "Quarterly Performance (FY)",
         "Surveyor Performance",
+        "Summary Report",
         "Quality Check Status"
     ]
     
@@ -989,6 +1126,62 @@ def main():
                                 
                                 st.dataframe(sm_trend, use_container_width=True, column_config={"% Resolved Same Quarter": st.column_config.NumberColumn(format="%.1f%%")})
                                 st.line_chart(sm_trend[['Tickets Raised', 'Closed Same Quarter']], use_container_width=True)
+
+                elif st.session_state.current_view == "Summary Report":
+                    st.subheader("📄 DSP Program Status — Summary Report")
+                    st.caption("Generates the standard printed status report: overall category summary "
+                               "followed by a zone-wise table for each category.")
+
+                    rc1, rc2 = st.columns(2)
+                    with rc1:
+                        report_date = st.date_input(
+                            "Report Date", value=datetime.now().date(), key="summary_report_date",
+                            help="Printed on the report header. Defaults to today."
+                        )
+                    with rc2:
+                        city_name = st.text_input("Report Heading", value="Lucknow Nagar Nigam", key="summary_city_name")
+
+                    cutoff = st.checkbox(
+                        "Count only tickets raised on or before the report date",
+                        value=False, key="summary_report_cutoff",
+                        help="Off by default - the report covers every ticket in the uploaded file. "
+                             "Tick this to cut the data off at the report date instead."
+                    )
+
+                    cat_table, zone_tables = build_summary_tables(
+                        df_processed, as_of_date=report_date if cutoff else None
+                    )
+
+                    if cat_table.empty or cat_table['Raised'].sum() == 0:
+                        st.warning("⚠️ No tickets fall within the selected reporting period.")
+                    else:
+                        st.markdown("#### Dispersed sources ticket resolution status")
+                        cat_display = _add_total_row(cat_table, 'Category').rename(columns={
+                            'Raised': 'Tickets raised', 'Closed': 'Tickets closed', 'Pending': 'Tickets pending',
+                            '% Closure': '% closure'
+                        })
+                        st.dataframe(cat_display, use_container_width=True, hide_index=True,
+                                     column_config={"% closure": st.column_config.NumberColumn(format="%.2f%%")})
+
+                        for category, zt in zone_tables.items():
+                            st.markdown(f"#### {category} Ticket status")
+                            st.dataframe(_add_total_row(zt, 'Zone'), use_container_width=True, hide_index=True,
+                                         column_config={"% Closure": st.column_config.NumberColumn(format="%.2f%%")})
+
+                        st.markdown("---")
+                        try:
+                            pdf_bytes = build_summary_pdf(cat_table, zone_tables, report_date, city_name)
+                            st.download_button(
+                                "📄 Download Report (PDF)",
+                                data=pdf_bytes,
+                                file_name=f"{city_name.replace(' ', '_')}_DSP_Report_{report_date.strftime('%Y%m%d')}.pdf",
+                                mime="application/pdf",
+                                type="primary"
+                            )
+                        except ImportError:
+                            st.error("⚠️ PDF export needs the `reportlab` package. Add `reportlab` to requirements.txt and redeploy.")
+                        except Exception as pdf_err:
+                            st.error(f"⚠️ Could not build the PDF: {pdf_err}")
 
                 elif st.session_state.current_view == "Surveyor Performance":
                     st.subheader("📝 Surveyor Performance & Operations")
