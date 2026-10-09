@@ -64,7 +64,7 @@ def load_dynamic_mappings():
         cat_df = pd.read_csv(SUBCAT_MAPPING_URL)
         if not cat_df.empty and len(cat_df.columns) >= 2:
             # Swapped iloc[:, 1] (Subcategory) as the key and iloc[:, 0] (Main Category) as the value
-            cat_map = dict(zip(cat_df.iloc[:, 1].astype(str).str.strip(), cat_df.iloc[:, 0].astype(str).str.strip()))
+            cat_map = dict(zip(cat_df.iloc[:, 1].map(norm_key), cat_df.iloc[:, 0].astype(str).str.strip()))
     except Exception as e:
         st.error(f"⚠️ Could not load Subcategory Mapping Sheet. Error: {e}")
 
@@ -72,7 +72,18 @@ def load_dynamic_mappings():
     try:
         surv_df = pd.read_csv(SURVEYOR_LIST_URL)
         if not surv_df.empty and len(surv_df.columns) >= 2:
-            surv_map = dict(zip(surv_df.iloc[:, 0].astype(str).str.strip(), surv_df.iloc[:, 1].astype(str).str.strip()))
+            surv_map = {}
+            for raw_name, nice_name in zip(surv_df.iloc[:, 0], surv_df.iloc[:, 1]):
+                nice = str(nice_name).strip()
+                if not nice or nice.lower() in ('nan', 'none'):
+                    continue
+                # Index each row under several keys: the exact login name, the login name
+                # with the 'Surveyor N' decoration stripped, and the rationalised name
+                # itself - so a login that differs only in its surveyor number still maps.
+                for key in (norm_key(raw_name), surveyor_name_key(raw_name),
+                            norm_key(nice), surveyor_name_key(nice)):
+                    if key and key not in ('nan', 'none'):
+                        surv_map.setdefault(key, nice)
     except Exception as e:
         st.error(f"⚠️ Could not load Surveyor Mapping Sheet. Error: {e}")
         
@@ -94,6 +105,24 @@ def display_with_fixed_footer(df, show_closure=True):
     st.dataframe(body, use_container_width=True, column_config=config)
     st.markdown("⬇️ **Grand Total**") 
     st.dataframe(total, use_container_width=True, column_config=config)
+
+def norm_key(value):
+    """Normalise a lookup key: NBSP -> space, collapse whitespace, strip, lowercase.
+    Keeps sheet-vs-export differences in casing/spacing from breaking a mapping."""
+    s = str(value).replace('\u00a0', ' ').replace('\u200b', '')
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s.lower()
+
+
+def surveyor_name_key(value):
+    """Reduce a surveyor name to the person, dropping the app's login decorations:
+    'Surveyor 1 Prem Prakash SURVEYOR' and 'Surveyor1 Prem Prakash' both -> 'prem prakash'.
+    Used as a fallback so a login whose Surveyor NUMBER differs from the sheet still matches."""
+    s = norm_key(value)
+    s = re.sub(r'^surveyor\s*\d*\s*', '', s)
+    s = re.sub(r'\s*surveyor$', '', s)
+    return s.strip()
+
 
 def _natural_zone_key(label):
     """Sort 'Zone 2' before 'Zone 10' instead of alphabetically."""
@@ -243,8 +272,12 @@ def build_summary_pdf(cat_table, zone_tables, report_date, city_name="Lucknow Na
     return buffer.getvalue()
 
 
-@st.cache_data
-def process_data(df):
+@st.cache_data(ttl=600)
+def process_data(df, cat_map, surv_map):
+    """The mappings are passed IN (not fetched inside) so that they form part of the
+    cache key - otherwise editing a Google Sheet never invalidates the cached result
+    for an already-uploaded file."""
+    df = df.copy()
     df.columns = df.columns.str.strip()
     
     missing_cols = [col for col in [COL_SUBCATEGORY, COL_STATUS, COL_CREATED] if col not in df.columns]
@@ -252,17 +285,16 @@ def process_data(df):
         st.error(f"❌ Missing critical columns in data: {', '.join(missing_cols)}")
         st.stop()
         
-    # Apply dynamic mappings
-    cat_map, surv_map = load_dynamic_mappings()
-    
-    # Clean and map categories
+    # Clean and map categories (matched on normalised keys)
     df['Subcategory_Clean'] = df[COL_SUBCATEGORY].astype(str).str.strip()
-    df['MainCategory'] = df['Subcategory_Clean'].map(cat_map).fillna("Others")
+    df['MainCategory'] = df[COL_SUBCATEGORY].map(norm_key).map(cat_map).fillna("Others")
     
     # Map Surveyors (Apply rationalized names, mark others as "IGNORED")
     if COL_SURVEYOR in df.columns:
         df['Raw_Surveyor'] = df[COL_SURVEYOR].astype(str).str.strip()
-        df['Rationalised_Surveyor'] = df['Raw_Surveyor'].map(surv_map).fillna("IGNORED")
+        exact_hit = df[COL_SURVEYOR].map(norm_key).map(surv_map)
+        name_hit = df[COL_SURVEYOR].map(surveyor_name_key).map(surv_map)
+        df['Rationalised_Surveyor'] = exact_hit.fillna(name_hit).fillna("IGNORED")
         
     # Status Buckets
     def get_bucket(status_name):
@@ -385,6 +417,14 @@ def main():
             st.session_state.current_view = view
             st.rerun()
 
+    st.sidebar.markdown("---")
+    if st.sidebar.button("🔄 Refresh mapping sheets", use_container_width=True,
+                         help="Re-reads the Category and Surveyor sheets immediately instead of "
+                              "waiting for the 10-minute cache to expire."):
+        load_dynamic_mappings.clear()
+        process_data.clear()
+        st.rerun()
+
     # ==========================================
     # VIEWS THAT DO NOT REQUIRE DATA DUMP
     # ==========================================
@@ -474,68 +514,152 @@ def main():
                         
                     st.markdown("---")
                     
-                    # --- 2. RAISED TICKETS QC ---
-                    st.markdown("### 🚨 Raised Tickets Quality Check")
-                    raised_chart_df = pd.concat([r_l1_counts, r_l2_counts]).dropna()
-                    
-                    # Full-width bar chart
-                    if not raised_chart_df.empty:
-                        raised_chart = alt.Chart(raised_chart_df).mark_bar().encode(
-                            x=alt.X('Status:N', title='Quality Status', axis=alt.Axis(labelAngle=0)),
-                            y=alt.Y('Count:Q', title='Tickets'),
-                            color=alt.Color('Level:N', legend=alt.Legend(title="Check Level", labelFontSize=11)),
-                            xOffset='Level:N'
-                        ).properties(height=400)
-                        st.altair_chart(raised_chart, use_container_width=True)
-                    else:
-                        st.info("No data found for Raised Quality Checks.")
-                        
-                    # Tables beneath chart
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.markdown("**L1 Raised Checks**")
-                        st.dataframe(r_l1_counts[['Status', 'Count']], use_container_width=True, hide_index=True)
-                    with c2:
-                        st.markdown("**L2 Raised Checks**")
-                        st.dataframe(r_l2_counts[['Status', 'Count']], use_container_width=True, hide_index=True)
-                        
-                    st.markdown("---")
-                    
-                    # --- 3. RESOLVED TICKETS QC ---
-                    st.markdown("### 🏁 Resolved Tickets Quality Check")
-                    res_chart_df = pd.concat([res_l1_counts, res_l2_counts]).dropna()
-                    
-                    # Full-width bar chart
-                    if not res_chart_df.empty:
-                        res_chart = alt.Chart(res_chart_df).mark_bar().encode(
-                            x=alt.X('Status:N', title='Quality Status', axis=alt.Axis(labelAngle=0)),
-                            y=alt.Y('Count:Q', title='Tickets'),
-                            color=alt.Color('Level:N', legend=alt.Legend(title="Check Level", labelFontSize=11)),
-                            xOffset='Level:N'
-                        ).properties(height=400)
-                        st.altair_chart(res_chart, use_container_width=True)
-                    else:
-                        st.info("No data found for Resolved Quality Checks.")
-                        
-                    # Tables beneath chart
-                    c3, c4 = st.columns(2)
-                    with c3:
-                        st.markdown("**L1 Resolved Checks**")
-                        st.dataframe(res_l1_counts[['Status', 'Count']], use_container_width=True, hide_index=True)
-                    with c4:
-                        st.markdown("**L2 Resolved Checks**")
-                        st.dataframe(res_l2_counts[['Status', 'Count']], use_container_width=True, hide_index=True)
-                        
-                    st.markdown("##### 📝 Reasons for Resolved Quality Checks")
-                    c5, c6 = st.columns(2)
-                    with c5:
-                        l1_reasons = qc_df[res_l1_rsn].value_counts().reset_index()
-                        l1_reasons.columns = ['L1 Reason (Col V)', 'Count']
-                        st.dataframe(l1_reasons, use_container_width=True, hide_index=True)
-                    with c6:
-                        l2_reasons = qc_df[res_l2_rsn].value_counts().reset_index()
-                        l2_reasons.columns = ['L2 Reason (Col W)', 'Count']
-                        st.dataframe(l2_reasons, use_container_width=True, hide_index=True)
+                    # --- 4. CATEGORY-WISE QC DISTRIBUTION ---
+                    try:
+                        st.markdown("### 📂 Category-wise Quality Check Distribution")
+
+                        # The Subcategory -> Category mapping sheet is the source of truth.
+                        # Instead of trusting the QC sheet's own headers, score EVERY column
+                        # against the mapping sheet's subcategory list and take the best match.
+                        qc_cat_map, _ = load_dynamic_mappings()
+                        if not qc_cat_map:
+                            st.warning("⚠️ The Subcategory mapping sheet is empty or could not be read, "
+                                       "so categories cannot be derived.")
+                            raise ValueError("Subcategory mapping sheet unavailable")
+
+                        mapping_keys = set(qc_cat_map.keys())
+                        col_scores = []
+                        for i in range(len(qc_df.columns)):
+                            vals = qc_df.iloc[:, i].astype(str).map(norm_key)
+                            col_scores.append(float(vals.isin(mapping_keys).mean()) if len(vals) else 0.0)
+
+                        qc_cat_idx = int(max(range(len(col_scores)), key=lambda i: col_scores[i]))
+                        qc_cat_col = qc_df.columns[qc_cat_idx]
+                        if col_scores[qc_cat_idx] == 0:
+                            st.warning("⚠️ No column in the QC sheet matches the subcategory list in the "
+                                       "mapping sheet. Check that the QC sheet spells subcategories the same "
+                                       "way the mapping sheet does.")
+
+                        qc_cat = qc_df.copy()
+                        raw_cat = qc_cat.iloc[:, qc_cat_idx].astype(str).str.strip()
+                        rolled_up = raw_cat.map(norm_key).map(qc_cat_map)
+                        match_rate = float(rolled_up.notna().mean()) if len(rolled_up) else 0.0
+
+                        # Always roll up through the mapping sheet; anything it doesn't cover is 'Others'.
+                        qc_cat['QC Category'] = rolled_up.fillna("Others")
+                        st.caption(f"Categories derived from '{qc_cat_col}' via the Subcategory mapping sheet "
+                                   f"({match_rate:.0%} of rows matched; the rest are counted as Others).")
+
+                        def _not_evaluated_mask(frame, col):
+                            return ~frame[col].astype(str).str.lower().str.contains('not evaluated', na=False)
+
+                        qc_scopes = {
+                            "Raised": [("L1 (Col R)", qc_cat, r_l1_col), ("L2 (Col S)", qc_cat, r_l2_col)],
+                            "Resolved": [
+                                ("L1 (Col T)", qc_cat[_not_evaluated_mask(qc_cat, res_l1_col)], res_l1_col),
+                                ("L2 (Col U)", qc_cat[_not_evaluated_mask(qc_cat, res_l2_col)], res_l2_col),
+                            ],
+                        }
+
+                        qc_display_mode = st.radio(
+                            "Show as", ["Ticket counts", "% within category"],
+                            horizontal=True, key="qc_cat_mode"
+                        )
+                        normalise = qc_display_mode.startswith("%")
+
+                        for scope_name, levels in qc_scopes.items():
+                            st.markdown(f"#### {'🚨' if scope_name == 'Raised' else '🏁'} {scope_name} Tickets by Category")
+                            lvl_cols = st.columns(2)
+                            for lvl_idx, (lvl_label, frame, status_col) in enumerate(levels):
+                                with lvl_cols[lvl_idx]:
+                                    st.markdown(f"**{lvl_label}**")
+                                    tidy = (
+                                        frame.dropna(subset=[status_col])
+                                             .groupby(['QC Category', status_col])
+                                             .size().reset_index(name='Count')
+                                             .rename(columns={status_col: 'Status', 'QC Category': 'Category'})
+                                    )
+                                    tidy = tidy[tidy['Count'] > 0]
+                                    if tidy.empty:
+                                        st.info("No data available.")
+                                        continue
+
+                                    tidy['Share %'] = (
+                                        tidy['Count'] / tidy.groupby('Category')['Count'].transform('sum') * 100
+                                    ).round(1)
+
+                                    y_field = alt.Y('Share %:Q', title='% of category', stack='zero') if normalise \
+                                        else alt.Y('Count:Q', title='Tickets', stack='zero')
+
+                                    bar = alt.Chart(tidy).mark_bar().encode(
+                                        x=alt.X('Category:N', title=None, axis=alt.Axis(labelAngle=0, labelLimit=0)),
+                                        y=y_field,
+                                        color=alt.Color('Status:N', legend=alt.Legend(
+                                            orient='bottom', title=None, labelFontSize=10, labelLimit=0)),
+                                        tooltip=['Category', 'Status', 'Count', 'Share %']
+                                    ).properties(
+                                        height=340,
+                                        # leave room for y-axis numbers on the left and the
+                                        # wrapped legend underneath, so neither gets clipped
+                                        padding={'left': 28, 'right': 16, 'top': 10, 'bottom': 16},
+                                        autosize=alt.AutoSizeParams(type='fit', contains='padding')
+                                    ).configure_legend(
+                                        labelLimit=0, columns=3, symbolSize=70, labelFontSize=11,
+                                        orient='bottom', direction='horizontal'
+                                    ).configure_axis(labelLimit=0)
+                                    st.altair_chart(bar, use_container_width=True)
+
+                                    pivot = tidy.pivot_table(index='Category', columns='Status',
+                                                             values='Count', aggfunc='sum', fill_value=0)
+                                    pivot['Total'] = pivot.sum(axis=1)
+                                    st.dataframe(pivot, use_container_width=True)
+
+
+                        # --- Reasons, broken down by subcategory ---
+                        st.markdown("---")
+                        st.markdown("##### 📝 Reasons for Resolved Quality Checks by Subcategory")
+
+                        qc_cat['QC Subcategory'] = raw_cat.replace(
+                            {'': 'Blank', 'nan': 'Blank', 'None': 'Blank'}
+                        )
+
+                        def _reason_counts(frame, col, label):
+                            s = frame[col].astype(str).str.strip()
+                            s = s[~s.str.lower().isin(['', 'nan', 'none', 'not evaluated', '-', 'na'])]
+                            out = s.value_counts().reset_index()
+                            out.columns = [label, 'Count']
+                            return out
+
+                        reason_cats = sorted(qc_cat['QC Category'].unique())
+                        chosen_cat = st.selectbox("Category", reason_cats, key="qc_reason_cat")
+                        cat_scope = qc_cat[qc_cat['QC Category'] == chosen_cat]
+
+                        subs_with_reasons = 0
+                        for sub in sorted(cat_scope['QC Subcategory'].unique()):
+                            sub_df = cat_scope[cat_scope['QC Subcategory'] == sub]
+                            l1_sub = _reason_counts(sub_df, res_l1_rsn, 'L1 Reason (Col V)')
+                            l2_sub = _reason_counts(sub_df, res_l2_rsn, 'L2 Reason (Col W)')
+                            if l1_sub.empty and l2_sub.empty:
+                                continue
+                            subs_with_reasons += 1
+                            st.markdown(f"**{sub}** — {len(sub_df):,} ticket(s)")
+                            rc1, rc2 = st.columns(2)
+                            with rc1:
+                                if l1_sub.empty:
+                                    st.caption("No L1 reasons recorded.")
+                                else:
+                                    st.dataframe(l1_sub, use_container_width=True, hide_index=True)
+                            with rc2:
+                                if l2_sub.empty:
+                                    st.caption("No L2 reasons recorded.")
+                                else:
+                                    st.dataframe(l2_sub, use_container_width=True, hide_index=True)
+
+                        if subs_with_reasons == 0:
+                            st.info(f"No quality-check reasons recorded for any subcategory under {chosen_cat}.")
+
+                    except Exception as cat_err:
+                        st.error(f"⚠️ Could not build the category-wise QC breakdown: {cat_err}")
 
                 else:
                     st.error("⚠️ The linked Google Sheet does not have enough columns. The tool requires data extending at least up to Column W (23 columns).")
@@ -555,7 +679,8 @@ def main():
                 else:
                     df_raw = pd.read_excel(uploaded_file)
                     
-                df_processed = process_data(df_raw)
+                cat_map, surv_map = load_dynamic_mappings()
+                df_processed = process_data(df_raw, cat_map, surv_map)
                 
                 main_categories = sorted(df_processed[df_processed['MainCategory'] != 'Others']['MainCategory'].unique().tolist())
                 if 'Others' in df_processed['MainCategory'].unique():
@@ -1237,12 +1362,42 @@ def main():
                         view_df = df_processed[df_processed['Rationalised_Surveyor'] != 'IGNORED'].copy()
                         
                         st.markdown("### 🏆 Top Surveyors Overview")
+
+                        # Which mapped surveyors actually appear in this upload, and which don't
+                        mapped_names = sorted(set(surv_map.values()))
+                        present_names = sorted(set(view_df['Rationalised_Surveyor'].dropna().unique()))
+                        missing_names = [n for n in mapped_names if n not in present_names]
+                        unmatched_raw = sorted(
+                            df_processed.loc[df_processed['Rationalised_Surveyor'] == 'IGNORED', 'Raw_Surveyor']
+                            .dropna().unique()
+                        ) if 'Raw_Surveyor' in df_processed.columns else []
+
+                        st.caption(f"{len(mapped_names)} surveyor(s) in the mapping sheet • "
+                                   f"{len(present_names)} with tickets in this upload")
+                        if missing_names or unmatched_raw:
+                            with st.expander("ℹ️ Surveyor mapping check"):
+                                if missing_names:
+                                    st.write("**In the sheet but no tickets in this file:** " + ", ".join(missing_names))
+                                if unmatched_raw:
+                                    st.write(f"**{len(unmatched_raw)} app login name(s) not found in the sheet "
+                                             "(counted as IGNORED):**")
+                                    st.write(", ".join(unmatched_raw[:50]))
+                                    st.caption("Add any of these to column A of the Surveyor sheet to include them.")
+
                         if all_years:
-                            surveyor_year = st.selectbox("Select Year for Overview", all_years, key="surv_year")
+                            sy1, sy2 = st.columns([1, 1])
+                            with sy1:
+                                surveyor_year = st.selectbox("Select Year for Overview", all_years, key="surv_year")
+                            with sy2:
+                                min_tickets = st.number_input(
+                                    "Minimum tickets to appear", min_value=1, value=1, step=1, key="surv_min_tickets",
+                                    help="Surveyors below this count are hidden from the overview table. "
+                                         "Set to 1 to show everyone who raised at least one ticket."
+                                )
                             surveyor_df = view_df[view_df[COL_CREATED].dt.year == surveyor_year]
                             if not surveyor_df.empty:
                                 user_ticket_counts = surveyor_df['Rationalised_Surveyor'].value_counts()
-                                top_users = user_ticket_counts[user_ticket_counts >= 10].index.tolist()
+                                top_users = user_ticket_counts[user_ticket_counts >= min_tickets].index.tolist()
                                 if top_users:
                                     top_surveyor_df = surveyor_df[surveyor_df['Rationalised_Surveyor'].isin(top_users)]
                                     surveyor_pivot = pd.crosstab(index=top_surveyor_df[COL_CREATED].dt.month, columns=top_surveyor_df['Rationalised_Surveyor'], margins=True, margins_name='**TOTAL**')
@@ -1250,7 +1405,7 @@ def main():
                                     surveyor_pivot.index.name = "Month"
                                     st.dataframe(surveyor_pivot, use_container_width=True)
                                 else:
-                                    st.info(f"No mapped surveyor raised enough tickets in {surveyor_year}.")
+                                    st.info(f"No mapped surveyor reached {min_tickets} ticket(s) in {surveyor_year}.")
                         
                         st.markdown("---")
                         st.markdown("### 🔍 Surveyor Deep Dive")
