@@ -119,16 +119,21 @@ def build_summary_tables(df, as_of_date=None):
         data = data[data[COL_CREATED].dt.date <= as_of_date]
 
     data['_IsClosed'] = data['StatusBucket'].isin(RESOLVED_STATUSES)
+    data['_IsSFA'] = data['StatusBucket'] == 'Submit for Approval'
 
     def summarise(frame, group_col, label):
         grouped = frame.groupby(group_col).agg(
             Raised=('_IsClosed', 'size'),
-            Closed=('_IsClosed', 'sum')
+            Closed=('_IsClosed', 'sum'),
+            SFA=('_IsSFA', 'sum')
         ).reset_index()
+        grouped = grouped.rename(columns={'SFA': 'Submit for Approval'})
+        # Pending still means everything not closed; 'Submit for Approval' is the
+        # subset of that pending pile which is awaiting sign-off.
         grouped['Pending'] = grouped['Raised'] - grouped['Closed']
         grouped['% Closure'] = (grouped['Closed'] / grouped['Raised'] * 100).where(grouped['Raised'] > 0, 0).round(2)
         grouped = grouped.rename(columns={group_col: label})
-        return grouped
+        return grouped[[label, 'Raised', 'Closed', 'Submit for Approval', 'Pending', '% Closure']]
 
     cat_table = summarise(data, 'MainCategory', 'Category')
     cat_table = cat_table.sort_values('Raised', ascending=False).reset_index(drop=True)
@@ -147,10 +152,12 @@ def build_summary_tables(df, as_of_date=None):
 def _add_total_row(table_df, first_col, label="Total"):
     raised = int(table_df['Raised'].sum())
     closed = int(table_df['Closed'].sum())
+    sfa = int(table_df['Submit for Approval'].sum()) if 'Submit for Approval' in table_df.columns else 0
     total = {
         first_col: label,
         'Raised': raised,
         'Closed': closed,
+        'Submit for Approval': sfa,
         'Pending': raised - closed,
         '% Closure': round(closed / raised * 100, 2) if raised else 0.0
     }
@@ -177,21 +184,27 @@ def build_summary_pdf(cat_table, zone_tables, report_date, city_name="Lucknow Na
     h_date = ParagraphStyle('DateLine', parent=styles['Normal'], fontSize=10, alignment=1, spaceAfter=10)
     h_sec = ParagraphStyle('Sec', parent=styles['Heading2'], fontSize=12, spaceBefore=10, spaceAfter=6)
 
+    h_cell = ParagraphStyle('HCell', parent=styles['Normal'], fontName='Helvetica-Bold',
+                            fontSize=8.5, leading=10, alignment=1, textColor=colors.white)
+
     def make_table(df_table, headers):
-        rows = [headers]
+        # Header labels are wrapped in Paragraphs so long ones break onto a
+        # second line instead of spilling over the neighbouring column.
+        rows = [[Paragraph(h, h_cell) for h in headers]]
         for _, r in df_table.iterrows():
             rows.append([
                 str(r.iloc[0]),
                 f"{int(r['Raised']):,}",
                 f"{int(r['Closed']):,}",
+                f"{int(r['Submit for Approval']):,}",
                 f"{int(r['Pending']):,}",
                 f"{r['% Closure']:.2f}%"
             ])
-        tbl = Table(rows, colWidths=[55 * mm] + [26 * mm] * 4, repeatRows=1, hAlign='LEFT')
+        tbl = Table(rows, colWidths=[42 * mm] + [26 * mm] * 5, repeatRows=1, hAlign='LEFT')
         tbl.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1F4E79')),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('VALIGN', (0, 0), (-1, 0), 'MIDDLE'),
             ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
             ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#DCE6F1')),
             ('FONTSIZE', (0, 0), (-1, -1), 9),
@@ -210,7 +223,8 @@ def build_summary_pdf(cat_table, zone_tables, report_date, city_name="Lucknow Na
         Paragraph(f"Date: {_format_report_date(report_date)}", h_date),
         Paragraph("Dispersed sources ticket resolution status", h_sec),
         make_table(_add_total_row(cat_table, 'Category'),
-                   ['Category', 'Tickets raised', 'Tickets closed', 'Tickets pending', '% closure']),
+                   ['Category', 'Tickets raised', 'Tickets closed', 'Submit for approval',
+                    'Tickets pending', '% closure']),
         Spacer(1, 6),
     ]
 
@@ -219,7 +233,7 @@ def build_summary_pdf(cat_table, zone_tables, report_date, city_name="Lucknow Na
         block = [
             Paragraph(f"{category} Ticket status", h_sec),
             make_table(_add_total_row(zt, 'Zone'),
-                       ['Zone', 'Raised', 'Closed', 'Pending', '% Closure']),
+                       ['Zone', 'Raised', 'Closed', 'Submit for Approval', 'Pending', '% Closure']),
             Spacer(1, 6),
         ]
         story.append(KeepTogether(block))
@@ -582,6 +596,38 @@ def main():
                         st.markdown("<br>", unsafe_allow_html=True)
                         st.markdown("##### 📂 Category-wise Breakdown")
                         st.dataframe(body_df, use_container_width=True, column_config={"% Closure": st.column_config.NumberColumn(format="%.1f%%")})
+
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        st.markdown("##### 🥧 Share of Tickets Raised by Category")
+                        cat_dist = df_processed['MainCategory'].value_counts().reset_index()
+                        cat_dist.columns = ['Category', 'Tickets Raised']
+                        total_raised = int(cat_dist['Tickets Raised'].sum())
+                        if total_raised > 0:
+                            cat_dist['Share %'] = (cat_dist['Tickets Raised'] / total_raised * 100).round(1)
+                            cat_dist['Label'] = cat_dist['Share %'].map(lambda v: f"{v:.1f}%")
+
+                            pie_base = alt.Chart(cat_dist).encode(
+                                theta=alt.Theta("Tickets Raised:Q", stack=True),
+                                color=alt.Color("Category:N",
+                                                scale=alt.Scale(scheme='tableau10'),
+                                                legend=alt.Legend(title="Category")),
+                                tooltip=['Category', 'Tickets Raised', 'Share %']
+                            )
+                            cat_pie = (
+                                pie_base.mark_arc(innerRadius=55, outerRadius=115)
+                                + pie_base.mark_text(radius=138, size=12).encode(text="Label:N")
+                            ).properties(height=320)
+
+                            pc1, pc2 = st.columns([3, 2])
+                            with pc1:
+                                st.altair_chart(cat_pie, use_container_width=True)
+                            with pc2:
+                                st.dataframe(
+                                    cat_dist[['Category', 'Tickets Raised', 'Share %']],
+                                    use_container_width=True, hide_index=True,
+                                    column_config={"Share %": st.column_config.NumberColumn(format="%.1f%%")}
+                                )
+                                st.caption(f"Based on all {total_raised:,} tickets raised, regardless of status.")
                     
                     st.markdown("---")
                     st.subheader("📊 Citywide & Zone-wise Snapshot")
@@ -1157,7 +1203,8 @@ def main():
                     else:
                         st.markdown("#### Dispersed sources ticket resolution status")
                         cat_display = _add_total_row(cat_table, 'Category').rename(columns={
-                            'Raised': 'Tickets raised', 'Closed': 'Tickets closed', 'Pending': 'Tickets pending',
+                            'Raised': 'Tickets raised', 'Closed': 'Tickets closed',
+                            'Submit for Approval': 'Submit for approval', 'Pending': 'Tickets pending',
                             '% Closure': '% closure'
                         })
                         st.dataframe(cat_display, use_container_width=True, hide_index=True,
