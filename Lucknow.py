@@ -28,7 +28,10 @@ COL_ASSIGNED    = "Assigned User Name"
 # --- Google Sheet URLs (Converted to CSV export links) ---
 SUBCAT_MAPPING_URL = "https://docs.google.com/spreadsheets/d/1R7NnhOQNibQtAI6OnUjvg8BtZ-SZGRKcIHi0f_qRM68/export?format=csv&gid=2005007155"
 SURVEYOR_LIST_URL = "https://docs.google.com/spreadsheets/d/1R7NnhOQNibQtAI6OnUjvg8BtZ-SZGRKcIHi0f_qRM68/export?format=csv&gid=1801847585"
-QC_SHEET_URL = "https://docs.google.com/spreadsheets/d/1Rl_rvPbBrpr86fsg9cpIbPEbm-GyZUBy22xHmMnvK-U/edit?gid=1455880256#gid=1455880256"
+QC_SHEET_URL = (
+    "https://docs.google.com/spreadsheets/d/e/2PACX-1vRuBQ0mhHm-JkKIymtE7gRHARPGRS3B6evvAq88Qv1"
+    "xRJGtBAtztWJ0EjIpSs75mW5kKattUbaHwNfV/pub?gid=940031451&single=true&output=csv"
+)
 
 # --- Status Buckets for Lucknow ---
 STATUS_COLUMNS = ["Open", "Submit for Approval", "Resolved", "Closed / Complied"]
@@ -42,8 +45,10 @@ RESOLVED_STATUSES = ["Resolved", "Closed / Complied"]
 def get_google_sheet_url(url):
     try:
         if "docs.google.com/spreadsheets" not in url: return None
-        # If it's already a CSV export link, just return it
-        if "/export?format=csv" in url: return url
+        # Already a CSV link - either an /export link or a File > Share > Publish
+        # to web link (/d/e/2PACX.../pub?...output=csv). Use it as given.
+        if "/export?format=csv" in url or "output=csv" in url: return url
+        if "/spreadsheets/d/e/" in url: return url
         parts = url.split('/')
         if 'd' in parts:
             d_index = parts.index('d')
@@ -272,6 +277,187 @@ def build_summary_pdf(cat_table, zone_tables, report_date, city_name="Lucknow Na
     return buffer.getvalue()
 
 
+def _qc_chart_png(kind, data, title=""):
+    """Render a QC chart to PNG bytes for embedding in the PDF.
+    kind 'donut' expects a DataFrame with Status/Count; kind 'bar' expects
+    Category/Status/Count and draws a stacked bar per category."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    buf = io.BytesIO()
+    palette = plt.get_cmap('tab20').colors
+
+    if kind == 'donut':
+        fig, ax = plt.subplots(figsize=(4.2, 3.4), dpi=150)
+        counts = data['Count'].tolist()
+        labels = [str(s) for s in data['Status'].tolist()]
+        total = sum(counts)
+        wedges, _ = ax.pie(counts, startangle=90, counterclock=False,
+                           colors=palette[:len(counts)], wedgeprops=dict(width=0.42))
+        ax.set_aspect('equal')
+        legend_labels = [f"{l} - {c} ({c / total * 100:.1f}%)" if total else l
+                         for l, c in zip(labels, counts)]
+        ax.legend(wedges, legend_labels, loc='upper center', bbox_to_anchor=(0.5, 0.02),
+                  fontsize=7, frameon=False, ncol=1)
+        if title:
+            ax.set_title(title, fontsize=10, fontweight='bold')
+    else:
+        pivot = data.pivot_table(index='Category', columns='Status',
+                                 values='Count', aggfunc='sum', fill_value=0)
+        # Plot each category as 100%, so categories of very different sizes
+        # stay comparable; the table underneath carries the absolute counts.
+        totals = pivot.sum(axis=1).replace(0, 1)
+        pct = pivot.div(totals, axis=0) * 100
+        fig, ax = plt.subplots(figsize=(7.2, 3.6), dpi=150)
+        bottom = [0] * len(pct.index)
+        for i, status in enumerate(pct.columns):
+            vals = pct[status].tolist()
+            ax.bar(pct.index.astype(str), vals, bottom=bottom,
+                   label=str(status), color=palette[i % len(palette)])
+            bottom = [b + v for b, v in zip(bottom, vals)]
+        ax.set_ylabel('% of category', fontsize=9)
+        ax.set_ylim(0, 100)
+        ax.tick_params(axis='both', labelsize=8)
+        ax.spines[['top', 'right']].set_visible(False)
+        ax.legend(fontsize=7, frameon=False, ncol=3,
+                  loc='upper center', bbox_to_anchor=(0.5, -0.12))
+        if title:
+            ax.set_title(title, fontsize=10, fontweight='bold')
+
+    fig.tight_layout()
+    fig.savefig(buf, format='png', bbox_inches='tight')
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def build_qc_pdf(qc_scopes_data, report_date, city_name="Lucknow Nagar Nigam"):
+    """Renders the Quality Check module to PDF bytes.
+
+    qc_scopes_data: list of dicts, each with
+        title, completed, pending, counts (Status/Count df), tidy (Category/Status/Count df or None)
+    """
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                    TableStyle, Image, KeepTogether)
+    from reportlab.lib.utils import ImageReader
+
+    def sized_image(buf, max_w, max_h):
+        """Place a PNG at its natural aspect ratio inside the given box.
+        Passing fixed width AND height to Image() stretches the picture, which
+        turns the donuts into ovals."""
+        buf.seek(0)
+        img_w, img_h = ImageReader(buf).getSize()
+        scale = min(max_w / img_w, max_h / img_h)
+        buf.seek(0)
+        return Image(buf, width=img_w * scale, height=img_h * scale)
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=A4,
+        leftMargin=16 * mm, rightMargin=16 * mm, topMargin=15 * mm, bottomMargin=15 * mm,
+        title=f"{city_name} DSP Quality Check Status"
+    )
+    styles = getSampleStyleSheet()
+    h_city = ParagraphStyle('City', parent=styles['Title'], fontSize=18, spaceAfter=2)
+    h_sub = ParagraphStyle('Sub', parent=styles['Title'], fontSize=13, spaceAfter=2)
+    h_date = ParagraphStyle('DateLine', parent=styles['Normal'], fontSize=10, alignment=1, spaceAfter=10)
+    h_sec = ParagraphStyle('Sec', parent=styles['Heading2'], fontSize=12, spaceBefore=8, spaceAfter=5)
+    h_sub2 = ParagraphStyle('Sub2', parent=styles['Heading3'], fontSize=10, spaceBefore=6, spaceAfter=4)
+    h_cell = ParagraphStyle('HCell', parent=styles['Normal'], fontName='Helvetica-Bold',
+                            fontSize=8.5, leading=10, alignment=1, textColor=colors.white)
+
+    def styled_table(rows, col_widths, total_row=False):
+        tbl = Table(rows, colWidths=col_widths, repeatRows=1, hAlign='LEFT')
+        style = [
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1F4E79')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, -1), 8.5),
+            ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#9BA7B4')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F4F6F8')]),
+            ('TOPPADDING', (0, 0), (-1, -1), 3),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ]
+        if total_row:
+            style += [('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+                      ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#DCE6F1'))]
+        tbl.setStyle(TableStyle(style))
+        return tbl
+
+    story = [
+        Paragraph(city_name, h_city),
+        Paragraph("DSP Quality Check Status", h_sub),
+        Paragraph(f"Date: {_format_report_date(report_date)}", h_date),
+    ]
+
+    # --- Completion summary across all four scopes ---
+    story.append(Paragraph("Quality check completion status", h_sec))
+    rows = [[Paragraph(h, h_cell) for h in
+             ['Scope', 'Completed', 'Pending', 'Total', '% Completed']]]
+    for sc in qc_scopes_data:
+        done, pend = int(sc['completed']), int(sc['pending'])
+        tot = done + pend
+        rows.append([sc['title'], f"{done:,}", f"{pend:,}", f"{tot:,}",
+                     f"{(done / tot * 100) if tot else 0:.2f}%"])
+    story.append(styled_table(rows, [58 * mm] + [30 * mm] * 4))
+    story.append(Spacer(1, 8))
+
+    # --- One block per scope: donut + status table, then category chart + table ---
+    for sc_idx, sc in enumerate(qc_scopes_data):
+        block = [Paragraph(sc['title'], h_sec)]
+
+        counts = sc['counts']
+        if counts is not None and not counts.empty and counts['Count'].sum() > 0:
+            total = int(counts['Count'].sum())
+            img = sized_image(_qc_chart_png('donut', counts), 78 * mm, 68 * mm)
+            st_rows = [[Paragraph(h, h_cell) for h in ['Status', 'Count', '% of completed']]]
+            for _, r in counts.iterrows():
+                st_rows.append([str(r['Status']), f"{int(r['Count']):,}",
+                                f"{r['Count'] / total * 100:.2f}%"])
+            st_rows.append(['Completed', f"{total:,}", '100.00%'])
+            st_rows.append(['Pending QC', f"{int(sc['pending']):,}", '-'])
+            side = styled_table(st_rows, [40 * mm, 22 * mm, 26 * mm], total_row=False)
+            pair = Table([[img, side]], colWidths=[82 * mm, 92 * mm], hAlign='LEFT')
+            pair.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                      ('LEFTPADDING', (0, 0), (-1, -1), 0)]))
+            block.append(pair)
+        else:
+            block.append(Paragraph("No quality check data recorded for this scope.", styles['Normal']))
+
+        story.append(KeepTogether(block))
+        story.append(Spacer(1, 4))
+
+        tidy = sc.get('tidy')
+        if tidy is not None and not tidy.empty:
+            cat_block = [Paragraph("By category", h_sub2),
+                         sized_image(_qc_chart_png('bar', tidy), 168 * mm, 82 * mm)]
+            pivot = tidy.pivot_table(index='Category', columns='Status',
+                                     values='Count', aggfunc='sum', fill_value=0)
+            pivot['Total'] = pivot.sum(axis=1)
+            headers = ['Category'] + [str(c) for c in pivot.columns]
+            cat_rows = [[Paragraph(h, h_cell) for h in headers]]
+            for cat, r in pivot.iterrows():
+                cat_rows.append([str(cat)] + [f"{int(v):,}" for v in r.tolist()])
+            totals = ['Total'] + [f"{int(pivot[c].sum()):,}" for c in pivot.columns]
+            cat_rows.append(totals)
+            n_val_cols = len(headers) - 1
+            cat_block.append(styled_table(
+                cat_rows, [40 * mm] + [min(26, 128 / max(n_val_cols, 1)) * mm] * n_val_cols,
+                total_row=True))
+            story.append(KeepTogether(cat_block))
+
+        story.append(Spacer(1, 8))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
 @st.cache_data(ttl=600)
 def process_data(df, cat_map, surv_map):
     """The mappings are passed IN (not fetched inside) so that they form part of the
@@ -471,19 +657,45 @@ def main():
                     res_l2_counts.columns = ['Status', 'Count']
                     res_l2_counts['Level'] = 'L2 (Col U)'
 
+                    # --- COMPLETED vs PENDING QC ---
+                    # A ticket is eligible for RESOLVED quality check only once an
+                    # after-image has been uploaded, so that column defines the universe.
+                    after_img_idx = None
+                    for i, c in enumerate(qc_df.columns):
+                        h = str(c).strip().lower()
+                        if 'after' in h and ('image' in h or 'photo' in h or 'img' in h or 'pic' in h):
+                            after_img_idx = i
+                            break
+                    if after_img_idx is None:
+                        for i, c in enumerate(qc_df.columns):
+                            if 'after' in str(c).strip().lower():
+                                after_img_idx = i
+                                break
+
+                    total_rows = len(qc_df)
+                    if after_img_idx is not None:
+                        after_vals = qc_df.iloc[:, after_img_idx].astype(str).str.strip()
+                        resolved_mask = after_vals.str.contains('http', case=False, na=False)
+                        resolved_universe = int(resolved_mask.sum())
+                    else:
+                        resolved_universe = total_rows
+                        st.warning("⚠️ No 'after image' column found in the QC sheet, so pending counts "
+                                   "for resolved tickets are measured against every row.")
+
                     # --- 1. INDIVIDUAL DISTRIBUTION PIE CHARTS ---
                     st.markdown("### 📊 Overall L1 vs L2 Distribution")
                     
                     chart_configs = [
-                        ("Raised Tickets (L1)", r_l1_counts),
-                        ("Raised Tickets (L2)", r_l2_counts),
-                        ("Resolved Tickets (L1)", res_l1_counts),
-                        ("Resolved Tickets (L2)", res_l2_counts)
+                        ("Raised Tickets (L1)", r_l1_counts, total_rows),
+                        ("Raised Tickets (L2)", r_l2_counts, total_rows),
+                        ("Resolved Tickets (L1)", res_l1_counts, resolved_universe),
+                        ("Resolved Tickets (L2)", res_l2_counts, resolved_universe)
                     ]
+                    qc_scopes_data = []
                     
                     pie_cols = st.columns(4)
                     
-                    for idx, (title, df_c) in enumerate(chart_configs):
+                    for idx, (title, df_c, universe) in enumerate(chart_configs):
                         with pie_cols[idx]:
                             st.markdown(f"<p style='text-align: center; font-weight: bold;'>{title}</p>", unsafe_allow_html=True)
                             if not df_c.empty and df_c['Count'].sum() > 0:
@@ -508,9 +720,22 @@ def main():
                                 ).properties(height=320)
                                 
                                 st.altair_chart(pie, use_container_width=True)
-                                st.markdown(f"<p style='text-align: center; font-weight: bold; margin-top: -15px;'>Total: {total_val}</p>", unsafe_allow_html=True)
+                                pending_val = max(int(universe) - int(total_val), 0)
+                                st.markdown(
+                                    f"<p style='text-align: center; font-weight: bold; margin-top: -15px;'>"
+                                    f"Completed: {total_val:,}</p>"
+                                    f"<p style='text-align: center; color: #d08700; margin-top: -12px;'>"
+                                    f"Pending QC: {pending_val:,}</p>",
+                                    unsafe_allow_html=True
+                                )
+                                qc_scopes_data.append({'title': title, 'counts': df_c[['Status', 'Count']].copy(),
+                                                       'completed': int(total_val), 'pending': pending_val,
+                                                       'tidy': None})
                             else:
                                 st.info("No data available.")
+                                qc_scopes_data.append({'title': title, 'counts': None,
+                                                       'completed': 0, 'pending': int(universe),
+                                                       'tidy': None})
                         
                     st.markdown("---")
                     
@@ -562,7 +787,7 @@ def main():
                         }
 
                         qc_display_mode = st.radio(
-                            "Show as", ["Ticket counts", "% within category"],
+                            "Show as", ["% within category", "Ticket counts"],
                             horizontal=True, key="qc_cat_mode"
                         )
                         normalise = qc_display_mode.startswith("%")
@@ -580,6 +805,11 @@ def main():
                                              .rename(columns={status_col: 'Status', 'QC Category': 'Category'})
                                     )
                                     tidy = tidy[tidy['Count'] > 0]
+                                    # Hand the same frame to the PDF builder; the loop runs in the
+                                    # same order as qc_scopes_data (Raised L1, L2, Resolved L1, L2).
+                                    pdf_slot = (0 if scope_name == 'Raised' else 2) + lvl_idx
+                                    if pdf_slot < len(qc_scopes_data):
+                                        qc_scopes_data[pdf_slot]['tidy'] = tidy.copy()
                                     if tidy.empty:
                                         st.info("No data available.")
                                         continue
@@ -657,6 +887,33 @@ def main():
 
                         if subs_with_reasons == 0:
                             st.info(f"No quality-check reasons recorded for any subcategory under {chosen_cat}.")
+
+                        # --- PDF export of the whole QC module ---
+                        st.markdown("---")
+                        st.markdown("##### 📄 Download Quality Check Report")
+                        qr1, qr2 = st.columns(2)
+                        with qr1:
+                            qc_report_date = st.date_input(
+                                "Report Date", value=datetime.now().date(), key="qc_report_date"
+                            )
+                        with qr2:
+                            qc_city_name = st.text_input(
+                                "Report Heading", value="Lucknow Nagar Nigam", key="qc_city_name"
+                            )
+                        try:
+                            qc_pdf_bytes = build_qc_pdf(qc_scopes_data, qc_report_date, qc_city_name)
+                            st.download_button(
+                                "📄 Download QC Report (PDF)",
+                                data=qc_pdf_bytes,
+                                file_name=f"{qc_city_name.replace(' ', '_')}_QC_Report_"
+                                          f"{qc_report_date.strftime('%Y%m%d')}.pdf",
+                                mime="application/pdf", type="primary"
+                            )
+                        except ImportError as imp_err:
+                            st.error("⚠️ PDF export needs `reportlab` and `matplotlib`. "
+                                     f"Add them to requirements.txt and redeploy. ({imp_err})")
+                        except Exception as qc_pdf_err:
+                            st.error(f"⚠️ Could not build the QC PDF: {qc_pdf_err}")
 
                     except Exception as cat_err:
                         st.error(f"⚠️ Could not build the category-wise QC breakdown: {cat_err}")
