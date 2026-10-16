@@ -1665,6 +1665,81 @@ def main():
                                     st.info(f"No mapped surveyor reached {min_tickets} ticket(s) in {surveyor_year}.")
                         
                         st.markdown("---")
+                        st.markdown("### 🗓️ Days Worked in a Month")
+                        try:
+                            st.caption("Counts the distinct dates on which each surveyor raised at least one ticket.")
+
+                            month_periods = sorted(view_df[COL_CREATED].dropna().dt.to_period('M').unique(), reverse=True)
+                            if not month_periods:
+                                st.info("No dated tickets available.")
+                            else:
+                                dm1, dm2 = st.columns(2)
+                                with dm1:
+                                    dw_year = st.selectbox(
+                                        "Year", sorted({p.year for p in month_periods}, reverse=True),
+                                        key="surv_days_year"
+                                    )
+                                with dm2:
+                                    year_months = [p.month for p in month_periods if p.year == dw_year]
+                                    dw_month = st.selectbox(
+                                        "Month", year_months,
+                                        format_func=lambda m: calendar.month_name[int(m)],
+                                        key="surv_days_month"
+                                    )
+
+                                dw_df = view_df[
+                                    (view_df[COL_CREATED].dt.year == dw_year)
+                                    & (view_df[COL_CREATED].dt.month == dw_month)
+                                ].copy()
+
+                                if dw_df.empty:
+                                    st.info(f"No tickets raised in {calendar.month_name[int(dw_month)]} {dw_year}.")
+                                else:
+                                    days_in_month = calendar.monthrange(int(dw_year), int(dw_month))[1]
+                                    dw_df['SurveyDate'] = dw_df[COL_CREATED].dt.date
+
+                                    days_table = (
+                                        dw_df.groupby('Rationalised_Surveyor')
+                                             .agg(**{'Days Worked': ('SurveyDate', 'nunique'),
+                                                     'Tickets Raised': ('SurveyDate', 'size')})
+                                             .reset_index()
+                                             .rename(columns={'Rationalised_Surveyor': 'Surveyor Name'})
+                                    )
+                                    days_table['Avg Tickets / Day'] = (
+                                        days_table['Tickets Raised'] / days_table['Days Worked']
+                                    ).round(1)
+                                    days_table = days_table.sort_values(
+                                        ['Days Worked', 'Tickets Raised'], ascending=False
+                                    ).reset_index(drop=True)
+                                    days_table.index = days_table.index + 1
+
+                                    dk1, dk2, dk3 = st.columns(3)
+                                    dk1.metric("Surveyors Active", len(days_table))
+                                    dk2.metric("Tickets Raised", f"{len(dw_df):,}")
+                                    dk3.metric("Days in Month", days_in_month)
+
+                                    st.dataframe(days_table, use_container_width=True)
+
+                                    st.download_button(
+                                        "⬇️ Download (CSV)",
+                                        data=days_table.to_csv(index=False).encode('utf-8-sig'),
+                                        file_name=f"days_worked_{dw_year}{int(dw_month):02d}.csv",
+                                        mime="text/csv",
+                                        key="surv_days_dl"
+                                    )
+
+                                    dw_inactive = sorted(
+                                        set(view_df['Rationalised_Surveyor'].dropna().unique())
+                                        - set(dw_df['Rationalised_Surveyor'].dropna().unique())
+                                    )
+                                    if dw_inactive:
+                                        with st.expander(f"🚫 {len(dw_inactive)} surveyor(s) raised no tickets this month"):
+                                            st.write(", ".join(dw_inactive))
+
+                        except Exception as dw_err:
+                            st.error(f"⚠️ Could not build the days-worked table: {dw_err}")
+
+                        st.markdown("---")
                         st.markdown("### 🔍 Surveyor Deep Dive")
                         c1, c2 = st.columns(2)
                         with c1:
