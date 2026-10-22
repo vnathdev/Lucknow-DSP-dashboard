@@ -522,6 +522,237 @@ def build_qc_pdf(qc_scopes_data, report_date, city_name="Lucknow Nagar Nigam", p
     return buffer.getvalue()
 
 @st.cache_data(ttl=600)
+def load_qc_resolved_split(cat_map, status_choice="Closed"):
+    """Resolved L1/L2 quality check counts, split by main category.
+
+    Reads the QC sheet directly so the detailed report can include QC figures
+    without the user visiting the Quality Check view first. Returns
+    {"Resolved L1 (Col T)": tidy_df, ...} with Category/Status/Count columns.
+    """
+    qc_url = get_google_sheet_url(QC_SHEET_URL)
+    if not qc_url or not cat_map:
+        return {}
+    qc = pd.read_csv(qc_url)
+    if len(qc.columns) < 21:
+        return {}
+
+    # Subcategory column = the one whose values best match the mapping sheet
+    mapping_keys = set(cat_map.keys())
+    scores = [float(qc.iloc[:, i].astype(str).map(norm_key).isin(mapping_keys).mean())
+              for i in range(len(qc.columns))]
+    best_idx = int(max(range(len(scores)), key=lambda i: scores[i]))
+    if scores[best_idx] == 0:
+        return {}
+    categories = qc.iloc[:, best_idx].astype(str).map(norm_key).map(cat_map).fillna("Others")
+
+    # Ticket status filter (Closed / Submit for Approval / both)
+    status_col = next((c for c in qc.columns if 'status' in str(c).strip().lower()), None)
+    if status_col is not None:
+        s = qc[status_col].astype(str).str.strip().str.lower()
+        closed = s.str.contains('closed') | s.str.contains('complied') | s.eq('resolved')
+        sfa = s.str.contains('submit') & s.str.contains('approval')
+        if status_choice == 'Closed':
+            status_mask = closed
+        elif status_choice == 'Submit for Approval':
+            status_mask = sfa
+        else:
+            status_mask = closed | sfa
+    else:
+        status_mask = pd.Series(True, index=qc.index)
+
+    out = {}
+    for label, col in [("Resolved L1", qc.columns[19]),
+                       ("Resolved L2", qc.columns[20])]:
+        evaluated = ~qc[col].astype(str).str.lower().str.contains('not evaluated', na=False)
+        keep = status_mask & evaluated & qc[col].notna()
+        if not keep.any():
+            continue
+        tidy = (pd.DataFrame({'Category': categories[keep], 'Status': qc.loc[keep, col]})
+                .groupby(['Category', 'Status']).size().reset_index(name='Count'))
+        tidy = tidy[tidy['Count'] > 0]
+        if not tidy.empty:
+            out[label] = tidy
+    return out
+
+
+def build_detailed_pdf(cat_table, zone_tables, report_date, city_name="Lucknow Nagar Nigam",
+                       qc_splits=None, qc_status_label="Closed"):
+    """Detailed report: category share pies, the standard status tables, and the
+    L1/L2 resolved quality check split by category."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                    TableStyle, Image, KeepTogether, CondPageBreak)
+    from reportlab.lib.utils import ImageReader
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=A4,
+        leftMargin=16 * mm, rightMargin=16 * mm, topMargin=15 * mm, bottomMargin=15 * mm,
+        title=f"{city_name} DSP Detailed Status Report"
+    )
+    styles = getSampleStyleSheet()
+    h_city = ParagraphStyle('City', parent=styles['Title'], fontSize=18, spaceAfter=2)
+    h_sub = ParagraphStyle('Sub', parent=styles['Title'], fontSize=13, spaceAfter=2)
+    h_date = ParagraphStyle('DateLine', parent=styles['Normal'], fontSize=10, alignment=1, spaceAfter=10)
+    h_sec = ParagraphStyle('Sec', parent=styles['Heading2'], fontSize=12, spaceBefore=8, spaceAfter=5)
+    h_sub2 = ParagraphStyle('Sub2', parent=styles['Heading3'], fontSize=10, spaceBefore=6, spaceAfter=4)
+    h_cell = ParagraphStyle('HCell', parent=styles['Normal'], fontName='Helvetica-Bold',
+                            fontSize=8.5, leading=10, alignment=1, textColor=colors.white)
+    h_note = ParagraphStyle('NoteLine', parent=styles['Normal'], fontSize=8, alignment=1,
+                            spaceAfter=8, textColor=colors.HexColor('#555555'))
+
+    def sized_image(buf, max_w, max_h):
+        buf.seek(0)
+        iw, ih = ImageReader(buf).getSize()
+        scale = min(max_w / iw, max_h / ih)
+        buf.seek(0)
+        return Image(buf, width=iw * scale, height=ih * scale)
+
+    def styled_table(rows, col_widths, total_row=False, bold_last_n=1):
+        tbl = Table(rows, colWidths=col_widths, repeatRows=1, hAlign='LEFT')
+        style = [
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1F4E79')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, -1), 8.5),
+            ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#9BA7B4')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F4F6F8')]),
+            ('TOPPADDING', (0, 0), (-1, -1), 3),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ]
+        if total_row:
+            first_bold = len(rows) - bold_last_n
+            style += [('FONTNAME', (0, first_bold), (-1, -1), 'Helvetica-Bold'),
+                      ('BACKGROUND', (0, first_bold), (-1, -1), colors.HexColor('#DCE6F1'))]
+        tbl.setStyle(TableStyle(style))
+        return tbl
+
+    def status_table(df_table, headers):
+        rows = [[Paragraph(h, h_cell) for h in headers]]
+        for _, r in df_table.iterrows():
+            rows.append([
+                str(r.iloc[0]),
+                f"{int(r['Raised']):,}",
+                f"{int(r['Closed']):,}",
+                f"{int(r['Submit for Approval']):,}",
+                f"{int(r['Pending']):,}",
+                f"{r['% Closure']:.2f}%"
+            ])
+        return styled_table(rows, [42 * mm] + [26 * mm] * 5, total_row=True)
+
+    story = [
+        Paragraph(city_name, h_city),
+        Paragraph("DSP Program Status - Detailed Report", h_sub),
+        Paragraph(f"Date: {_format_report_date(report_date)}", h_date),
+    ]
+
+    # --- 1. Category share of raised vs closed ---
+    story.append(Paragraph("Category share of tickets", h_sec))
+    pie_cells = []
+    for value_col, caption in [('Raised', 'Share of tickets raised'),
+                               ('Closed', 'Share of tickets closed')]:
+        slice_df = cat_table[cat_table[value_col] > 0]
+        if slice_df.empty:
+            continue
+        donut_src = pd.DataFrame({'Status': slice_df['Category'].tolist(),
+                                  'Count': slice_df[value_col].tolist()})
+        pie_cells.append(sized_image(_qc_chart_png('donut', donut_src, caption), 84 * mm, 70 * mm))
+    if pie_cells:
+        if len(pie_cells) == 1:
+            pie_cells[0].hAlign = 'CENTER'
+            story.append(pie_cells[0])
+        else:
+            # Centre the pair on the page, and each donut within its own half
+            pair = Table([pie_cells], colWidths=[86 * mm, 86 * mm], hAlign='CENTER')
+            pair.setStyle(TableStyle([
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+            ]))
+            story.append(pair)
+    story.append(Spacer(1, 6))
+
+    # --- 2. Standard status tables ---
+    story.append(Paragraph("Dispersed sources ticket resolution status", h_sec))
+    story.append(status_table(
+        _add_total_row(cat_table, 'Category'),
+        ['Category', 'Tickets raised', 'Tickets closed', 'Submit for approval',
+         'Tickets pending', '% closure']))
+    story.append(Spacer(1, 6))
+
+    for category, zt in zone_tables.items():
+        block = [Paragraph(f"{category} Ticket status", h_sec),
+                 status_table(_add_total_row(zt, 'Zone'),
+                              ['Zone', 'Raised', 'Closed', 'Submit for Approval',
+                               'Pending', '% Closure']),
+                 Spacer(1, 6)]
+        story.append(KeepTogether(block))
+
+    # --- 3. Quality check split for resolved tickets ---
+    if qc_splits:
+        # Break first unless there is room for the heading AND a full block, so the
+        # heading is never stranded at the foot of a page.
+        story.append(CondPageBreak(125 * mm))
+        story.append(Paragraph("Resolved ticket quality check by category", h_sec))
+        story.append(Paragraph(f"Tickets counted: {qc_status_label}", h_note))
+        for label, tidy in qc_splits.items():
+            pivot = tidy.pivot_table(index='Category', columns='Status',
+                                     values='Count', aggfunc='sum', fill_value=0)
+            pivot['Total'] = pivot.sum(axis=1)
+            correct_col = _correct_status_col(pivot.columns)
+            headers = ['Category'] + [str(c) for c in pivot.columns]
+            if correct_col is not None:
+                headers.append('% Correct')
+            rows = [[Paragraph(h, h_cell) for h in headers]]
+            for cat, r in pivot.iterrows():
+                row = [str(cat)] + [f"{int(v):,}" for v in r.tolist()]
+                if correct_col is not None:
+                    tot = int(r['Total'])
+                    row.append(f"{int(r[correct_col]) / tot * 100:.1f}%" if tot else "-")
+                rows.append(row)
+            totals = ['Total'] + [f"{int(pivot[c].sum()):,}" for c in pivot.columns]
+            if correct_col is not None:
+                grand = int(pivot['Total'].sum())
+                totals.append(f"{int(pivot[correct_col].sum()) / grand * 100:.1f}%" if grand else "-")
+            rows.append(totals)
+
+            bold_rows = 1
+            st_slice = _short_term_slice(pivot)
+            if st_slice is not None:
+                st_label = ParagraphStyle('STCell2', parent=styles['Normal'], fontSize=8,
+                                          leading=9.5, fontName='Helvetica-Bold')
+                st_row = [Paragraph(SHORT_TERM_LABEL, st_label)] + \
+                         [f"{int(st_slice[c].sum()):,}" for c in pivot.columns]
+                if correct_col is not None:
+                    st_tot = int(st_slice['Total'].sum())
+                    st_row.append(f"{int(st_slice[correct_col].sum()) / st_tot * 100:.1f}%"
+                                  if st_tot else "-")
+                rows.append(st_row)
+                bold_rows = 2
+
+            n_val = len(headers) - 1
+            block = [
+                Paragraph(label, h_sub2),
+                sized_image(_qc_chart_png('bar', tidy), 151 * mm, 64 * mm),
+                styled_table(rows, [40 * mm] + [min(26, 128 / max(n_val, 1)) * mm] * n_val,
+                             total_row=True, bold_last_n=bold_rows),
+                Spacer(1, 6)]
+            # Keep the label with its chart, then let the table follow naturally -
+            # wrapping the whole block reserves more height than it needs and
+            # bumps the second level onto its own page.
+            story.append(KeepTogether(block[:2]))
+            story.append(KeepTogether(block[2:]))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+@st.cache_data(ttl=600)
 def process_data(df, cat_map, surv_map):
     """The mappings are passed IN (not fetched inside) so that they form part of the
     cache key - otherwise editing a Google Sheet never invalidates the cached result
@@ -1836,15 +2067,38 @@ def main():
                                          column_config={"% Closure": st.column_config.NumberColumn(format="%.2f%%")})
 
                         st.markdown("---")
+                        dl1, dl2 = st.columns(2)
                         try:
                             pdf_bytes = build_summary_pdf(cat_table, zone_tables, report_date, city_name)
-                            st.download_button(
-                                "📄 Download Report (PDF)",
-                                data=pdf_bytes,
-                                file_name=f"{city_name.replace(' ', '_')}_DSP_Report_{report_date.strftime('%Y%m%d')}.pdf",
-                                mime="application/pdf",
-                                type="primary"
-                            )
+                            with dl1:
+                                st.download_button(
+                                    "📄 Download Report (PDF)",
+                                    data=pdf_bytes,
+                                    file_name=f"{city_name.replace(' ', '_')}_DSP_Report_{report_date.strftime('%Y%m%d')}.pdf",
+                                    mime="application/pdf",
+                                    type="primary"
+                                )
+                            with dl2:
+                                detail_status = st.selectbox(
+                                    "Quality check: tickets counted",
+                                    ["Closed", "Submit for Approval", "Closed + Submit for Approval"],
+                                    key="detail_qc_status"
+                                )
+                                qc_splits = load_qc_resolved_split(cat_map, detail_status)
+                                if not qc_splits:
+                                    st.caption("ℹ️ Quality check data unavailable - the detailed report "
+                                               "will be produced without the QC section.")
+                                detailed_bytes = build_detailed_pdf(
+                                    cat_table, zone_tables, report_date, city_name,
+                                    qc_splits=qc_splits, qc_status_label=detail_status
+                                )
+                                st.download_button(
+                                    "📘 Download Detailed Report (PDF)",
+                                    data=detailed_bytes,
+                                    file_name=f"{city_name.replace(' ', '_')}_DSP_Detailed_Report_"
+                                              f"{report_date.strftime('%Y%m%d')}.pdf",
+                                    mime="application/pdf"
+                                )
                         except ImportError:
                             st.error("⚠️ PDF export needs the `reportlab` package. Add `reportlab` to requirements.txt and redeploy.")
                         except Exception as pdf_err:
