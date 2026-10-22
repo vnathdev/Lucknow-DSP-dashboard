@@ -277,6 +277,25 @@ def build_summary_pdf(cat_table, zone_tables, report_date, city_name="Lucknow Na
     return buffer.getvalue()
 
 
+SHORT_TERM_CATEGORIES = ['sanitation', 'malba']
+SHORT_TERM_LABEL = 'Short-term (Sanitation + Malba)'
+
+
+def _short_term_slice(pivot):
+    """Rows of a category pivot that count as short-term tickets."""
+    idx = [i for i in pivot.index if str(i).strip().lower() in SHORT_TERM_CATEGORIES]
+    return pivot.loc[idx] if idx else None
+
+
+def _correct_status_col(columns):
+    """Return the status column that means a good-quality check.
+    Matched exactly so 'Incorrect' is never mistaken for 'Correct'."""
+    for c in columns:
+        if str(c).strip().lower() == 'correct':
+            return c
+    return None
+
+
 def _qc_chart_png(kind, data, title=""):
     """Render a QC chart to PNG bytes for embedding in the PDF.
     kind 'donut' expects a DataFrame with Status/Count; kind 'bar' expects
@@ -332,7 +351,7 @@ def _qc_chart_png(kind, data, title=""):
     return buf
 
 
-def build_qc_pdf(qc_scopes_data, report_date, city_name="Lucknow Nagar Nigam"):
+def build_qc_pdf(qc_scopes_data, report_date, city_name="Lucknow Nagar Nigam", period_label=None):
     """Renders the Quality Check module to PDF bytes.
 
     qc_scopes_data: list of dicts, each with
@@ -361,6 +380,7 @@ def build_qc_pdf(qc_scopes_data, report_date, city_name="Lucknow Nagar Nigam"):
         buffer, pagesize=A4,
         leftMargin=16 * mm, rightMargin=16 * mm, topMargin=15 * mm, bottomMargin=15 * mm,
         title=f"{city_name} DSP Quality Check Status"
+             + (f" - {period_label}" if period_label else "")
     )
     styles = getSampleStyleSheet()
     h_city = ParagraphStyle('City', parent=styles['Title'], fontSize=18, spaceAfter=2)
@@ -371,7 +391,7 @@ def build_qc_pdf(qc_scopes_data, report_date, city_name="Lucknow Nagar Nigam"):
     h_cell = ParagraphStyle('HCell', parent=styles['Normal'], fontName='Helvetica-Bold',
                             fontSize=8.5, leading=10, alignment=1, textColor=colors.white)
 
-    def styled_table(rows, col_widths, total_row=False):
+    def styled_table(rows, col_widths, total_row=False, bold_last_n=1):
         tbl = Table(rows, colWidths=col_widths, repeatRows=1, hAlign='LEFT')
         style = [
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1F4E79')),
@@ -385,16 +405,29 @@ def build_qc_pdf(qc_scopes_data, report_date, city_name="Lucknow Nagar Nigam"):
             ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
         ]
         if total_row:
-            style += [('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
-                      ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#DCE6F1'))]
+            first_bold = len(rows) - bold_last_n
+            style += [('FONTNAME', (0, first_bold), (-1, -1), 'Helvetica-Bold'),
+                      ('BACKGROUND', (0, first_bold), (-1, -1), colors.HexColor('#DCE6F1'))]
         tbl.setStyle(TableStyle(style))
         return tbl
+
+    h_period = ParagraphStyle('PeriodLine', parent=styles['Normal'], fontSize=10,
+                              alignment=1, spaceAfter=2, fontName='Helvetica-Bold')
+    h_note = ParagraphStyle('NoteLine', parent=styles['Normal'], fontSize=8,
+                            alignment=1, spaceAfter=10, textColor=colors.HexColor('#555555'))
 
     story = [
         Paragraph(city_name, h_city),
         Paragraph("DSP Quality Check Status", h_sub),
-        Paragraph(f"Date: {_format_report_date(report_date)}", h_date),
+        Paragraph(f"Date: {_format_report_date(report_date)}",
+                  h_date if not period_label else h_period),
     ]
+    if period_label:
+        # A month/year filter was active in the dashboard - say so on the report.
+        story.append(Paragraph(f"Period: {period_label}", h_period))
+        story.append(Paragraph(
+            "Category-wise figures cover the selected period; "
+            "the completion status and distribution charts cover all months.", h_note))
 
     # --- Completion summary across all four scopes ---
     story.append(Paragraph("Quality check completion status", h_sec))
@@ -440,16 +473,42 @@ def build_qc_pdf(qc_scopes_data, report_date, city_name="Lucknow Nagar Nigam"):
             pivot = tidy.pivot_table(index='Category', columns='Status',
                                      values='Count', aggfunc='sum', fill_value=0)
             pivot['Total'] = pivot.sum(axis=1)
+            correct_col = _correct_status_col(pivot.columns)
             headers = ['Category'] + [str(c) for c in pivot.columns]
+            if correct_col is not None:
+                headers.append('% Correct')
             cat_rows = [[Paragraph(h, h_cell) for h in headers]]
             for cat, r in pivot.iterrows():
-                cat_rows.append([str(cat)] + [f"{int(v):,}" for v in r.tolist()])
+                row = [str(cat)] + [f"{int(v):,}" for v in r.tolist()]
+                if correct_col is not None:
+                    tot = int(r['Total'])
+                    row.append(f"{int(r[correct_col]) / tot * 100:.1f}%" if tot else "-")
+                cat_rows.append(row)
             totals = ['Total'] + [f"{int(pivot[c].sum()):,}" for c in pivot.columns]
+            if correct_col is not None:
+                grand = int(pivot['Total'].sum())
+                totals.append(f"{int(pivot[correct_col].sum()) / grand * 100:.1f}%" if grand else "-")
             cat_rows.append(totals)
+
+            bold_rows = 1
+            if str(sc['title']).lower().startswith('resolved'):
+                st_slice = _short_term_slice(pivot)
+                if st_slice is not None:
+                    st_label = ParagraphStyle('STCell', parent=styles['Normal'], fontSize=8,
+                                              leading=9.5, fontName='Helvetica-Bold')
+                    st_row = [Paragraph(SHORT_TERM_LABEL, st_label)] + \
+                             [f"{int(st_slice[c].sum()):,}" for c in pivot.columns]
+                    if correct_col is not None:
+                        st_tot = int(st_slice['Total'].sum())
+                        st_row.append(
+                            f"{int(st_slice[correct_col].sum()) / st_tot * 100:.1f}%" if st_tot else "-")
+                    cat_rows.append(st_row)
+                    bold_rows = 2
+
             n_val_cols = len(headers) - 1
             cat_block.append(styled_table(
                 cat_rows, [40 * mm] + [min(26, 128 / max(n_val_cols, 1)) * mm] * n_val_cols,
-                total_row=True))
+                total_row=True, bold_last_n=bold_rows))
             story.append(KeepTogether(cat_block))
 
         story.append(Spacer(1, 8))
@@ -778,6 +837,66 @@ def main():
                         def _not_evaluated_mask(frame, col):
                             return ~frame[col].astype(str).str.lower().str.contains('not evaluated', na=False)
 
+                        # --- Display mode + month/year filter ---
+                        qc_ticket_date = None
+                        for c in qc_df.columns:
+                            if 'created' in str(c).strip().lower():
+                                qc_ticket_date = c
+                                break
+                        if qc_ticket_date is None:
+                            for c in qc_df.columns:
+                                if 'date' in str(c).strip().lower():
+                                    qc_ticket_date = c
+                                    break
+
+                        if qc_ticket_date is not None:
+                            qc_cat['_QCDate'] = pd.to_datetime(qc_cat[qc_ticket_date],
+                                                               dayfirst=True, errors='coerce')
+                        else:
+                            qc_cat['_QCDate'] = pd.NaT
+
+                        fc1, fc2, fc3 = st.columns([2, 1, 1])
+                        with fc1:
+                            qc_display_mode = st.radio(
+                                "Show as", ["% within category", "Ticket counts"],
+                                horizontal=True, key="qc_cat_mode"
+                            )
+                        qc_years = sorted(qc_cat['_QCDate'].dropna().dt.year.unique().tolist(), reverse=True)
+                        with fc2:
+                            qc_year_pick = st.selectbox("Year", ["All"] + [int(y) for y in qc_years],
+                                                        key="qc_filter_year")
+                        with fc3:
+                            if qc_year_pick == "All":
+                                month_pool = sorted(qc_cat['_QCDate'].dropna().dt.month.unique().tolist())
+                            else:
+                                month_pool = sorted(qc_cat.loc[qc_cat['_QCDate'].dt.year == qc_year_pick,
+                                                               '_QCDate'].dropna().dt.month.unique().tolist())
+                            qc_month_pick = st.selectbox(
+                                "Month", ["All"] + [int(m) for m in month_pool],
+                                format_func=lambda m: "All" if m == "All" else calendar.month_name[int(m)],
+                                key="qc_filter_month"
+                            )
+
+                        normalise = qc_display_mode.startswith("%")
+
+                        if qc_year_pick != "All":
+                            qc_cat = qc_cat[qc_cat['_QCDate'].dt.year == qc_year_pick]
+                        if qc_month_pick != "All":
+                            qc_cat = qc_cat[qc_cat['_QCDate'].dt.month == qc_month_pick]
+
+                        if qc_year_pick == "All" and qc_month_pick == "All":
+                            st.caption(f"Showing all {len(qc_cat):,} tickets.")
+                        else:
+                            period_label = " ".join(
+                                ([calendar.month_name[int(qc_month_pick)]] if qc_month_pick != "All" else [])
+                                + ([str(qc_year_pick)] if qc_year_pick != "All" else [])
+                            )
+                            st.caption(f"Filtered to {period_label} - {len(qc_cat):,} ticket(s). "
+                                       "The distribution charts above cover all months.")
+
+                        if qc_cat.empty:
+                            st.info("No tickets in the selected period.")
+
                         qc_scopes = {
                             "Raised": [("L1 (Col R)", qc_cat, r_l1_col), ("L2 (Col S)", qc_cat, r_l2_col)],
                             "Resolved": [
@@ -785,12 +904,6 @@ def main():
                                 ("L2 (Col U)", qc_cat[_not_evaluated_mask(qc_cat, res_l2_col)], res_l2_col),
                             ],
                         }
-
-                        qc_display_mode = st.radio(
-                            "Show as", ["% within category", "Ticket counts"],
-                            horizontal=True, key="qc_cat_mode"
-                        )
-                        normalise = qc_display_mode.startswith("%")
 
                         for scope_name, levels in qc_scopes.items():
                             st.markdown(f"#### {'🚨' if scope_name == 'Raised' else '🏁'} {scope_name} Tickets by Category")
@@ -842,7 +955,31 @@ def main():
                                     pivot = tidy.pivot_table(index='Category', columns='Status',
                                                              values='Count', aggfunc='sum', fill_value=0)
                                     pivot['Total'] = pivot.sum(axis=1)
-                                    st.dataframe(pivot, use_container_width=True)
+                                    correct_col = _correct_status_col(pivot.columns)
+                                    if correct_col is not None:
+                                        pivot['% Correct'] = (
+                                            pivot[correct_col] / pivot['Total'].replace(0, pd.NA) * 100
+                                        ).astype(float).round(1)
+
+                                    # Sanitation + Malba are the short-term tickets; show their
+                                    # combined quality under the resolved tables.
+                                    if scope_name == 'Resolved':
+                                        st_slice = _short_term_slice(pivot)
+                                        if st_slice is not None:
+                                            st_total = int(st_slice['Total'].sum())
+                                            combined = {c: int(st_slice[c].sum())
+                                                        for c in pivot.columns if c != '% Correct'}
+                                            if correct_col is not None:
+                                                combined['% Correct'] = round(
+                                                    int(st_slice[correct_col].sum()) / st_total * 100, 1
+                                                ) if st_total else None
+                                            pivot = pd.concat(
+                                                [pivot, pd.DataFrame([combined], index=[SHORT_TERM_LABEL])]
+                                            )
+                                    st.dataframe(
+                                        pivot, use_container_width=True,
+                                        column_config={"% Correct": st.column_config.NumberColumn(format="%.1f%%")}
+                                    )
 
 
                         # --- Reasons, broken down by subcategory ---
@@ -900,13 +1037,25 @@ def main():
                             qc_city_name = st.text_input(
                                 "Report Heading", value="Lucknow Nagar Nigam", key="qc_city_name"
                             )
+                        if qc_year_pick == "All" and qc_month_pick == "All":
+                            qc_pdf_period = None
+                            qc_period_slug = ""
+                        else:
+                            qc_pdf_period = " ".join(
+                                ([calendar.month_name[int(qc_month_pick)]] if qc_month_pick != "All" else [])
+                                + ([str(qc_year_pick)] if qc_year_pick != "All" else [])
+                            )
+                            qc_period_slug = "_" + qc_pdf_period.replace(" ", "_")
+                            st.caption(f"The report will be labelled: {qc_pdf_period}")
+
                         try:
-                            qc_pdf_bytes = build_qc_pdf(qc_scopes_data, qc_report_date, qc_city_name)
+                            qc_pdf_bytes = build_qc_pdf(qc_scopes_data, qc_report_date, qc_city_name,
+                                                        period_label=qc_pdf_period)
                             st.download_button(
                                 "📄 Download QC Report (PDF)",
                                 data=qc_pdf_bytes,
-                                file_name=f"{qc_city_name.replace(' ', '_')}_QC_Report_"
-                                          f"{qc_report_date.strftime('%Y%m%d')}.pdf",
+                                file_name=f"{qc_city_name.replace(' ', '_')}_QC_Report"
+                                          f"{qc_period_slug}_{qc_report_date.strftime('%Y%m%d')}.pdf",
                                 mime="application/pdf", type="primary"
                             )
                         except ImportError as imp_err:
@@ -1010,6 +1159,52 @@ def main():
                                     column_config={"Share %": st.column_config.NumberColumn(format="%.1f%%")}
                                 )
                                 st.caption(f"Based on all {total_raised:,} tickets raised, regardless of status.")
+
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        st.markdown("##### 🥧 Share of Tickets Resolved by Category")
+                        resolved_only = df_processed[df_processed['StatusBucket'].isin(RESOLVED_STATUSES)]
+                        res_dist = resolved_only['MainCategory'].value_counts().reset_index()
+                        res_dist.columns = ['Category', 'Tickets Resolved']
+                        total_resolved = int(res_dist['Tickets Resolved'].sum())
+                        if total_resolved == 0:
+                            st.info("No tickets have been resolved yet, so there is nothing to split by category.")
+                        else:
+                            res_dist['Share %'] = (res_dist['Tickets Resolved'] / total_resolved * 100).round(1)
+                            res_dist['Label'] = res_dist['Share %'].map(lambda v: f"{v:.1f}%")
+
+                            res_pie_base = alt.Chart(res_dist).encode(
+                                theta=alt.Theta("Tickets Resolved:Q", stack=True),
+                                color=alt.Color("Category:N",
+                                                scale=alt.Scale(scheme='tableau10'),
+                                                legend=alt.Legend(title="Category")),
+                                tooltip=['Category', 'Tickets Resolved', 'Share %']
+                            )
+                            res_pie = (
+                                res_pie_base.mark_arc(innerRadius=55, outerRadius=115)
+                                + res_pie_base.mark_text(radius=138, size=12).encode(text="Label:N")
+                            ).properties(height=320)
+
+                            rc1, rc2 = st.columns([3, 2])
+                            with rc1:
+                                st.altair_chart(res_pie, use_container_width=True)
+                            with rc2:
+                                # Closure rate per category, so a big slice isn't mistaken for good performance
+                                res_table = res_dist[['Category', 'Tickets Resolved', 'Share %']].merge(
+                                    cat_dist[['Category', 'Tickets Raised']], on='Category', how='left'
+                                )
+                                res_table['% Closure'] = (
+                                    res_table['Tickets Resolved'] / res_table['Tickets Raised'] * 100
+                                ).round(1)
+                                st.dataframe(
+                                    res_table[['Category', 'Tickets Resolved', 'Share %', '% Closure']],
+                                    use_container_width=True, hide_index=True,
+                                    column_config={
+                                        "Share %": st.column_config.NumberColumn(format="%.1f%%"),
+                                        "% Closure": st.column_config.NumberColumn(format="%.1f%%")
+                                    }
+                                )
+                                st.caption(f"Based on {total_resolved:,} resolved tickets "
+                                           f"({', '.join(RESOLVED_STATUSES)}).")
                     
                     st.markdown("---")
                     st.subheader("📊 Citywide & Zone-wise Snapshot")
