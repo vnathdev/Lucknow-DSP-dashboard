@@ -351,7 +351,8 @@ def _qc_chart_png(kind, data, title=""):
     return buf
 
 
-def build_qc_pdf(qc_scopes_data, report_date, city_name="Lucknow Nagar Nigam", period_label=None):
+def build_qc_pdf(qc_scopes_data, report_date, city_name="Lucknow Nagar Nigam", period_label=None,
+                 resolved_status_label=None):
     """Renders the Quality Check module to PDF bytes.
 
     qc_scopes_data: list of dicts, each with
@@ -425,9 +426,12 @@ def build_qc_pdf(qc_scopes_data, report_date, city_name="Lucknow Nagar Nigam", p
     if period_label:
         # A month/year filter was active in the dashboard - say so on the report.
         story.append(Paragraph(f"Period: {period_label}", h_period))
+    if resolved_status_label:
+        story.append(Paragraph(f"Resolved tickets counted: {resolved_status_label}", h_period))
+    if period_label or resolved_status_label:
         story.append(Paragraph(
-            "Category-wise figures cover the selected period; "
-            "the completion status and distribution charts cover all months.", h_note))
+            "Category-wise figures reflect the filters above; "
+            "the completion status and distribution charts cover all months and statuses.", h_note))
 
     # --- Completion summary across all four scopes ---
     story.append(Paragraph("Quality check completion status", h_sec))
@@ -855,7 +859,13 @@ def main():
                         else:
                             qc_cat['_QCDate'] = pd.NaT
 
-                        fc1, fc2, fc3 = st.columns([2, 1, 1])
+                        qc_status_col = None
+                        for c in qc_df.columns:
+                            if 'status' in str(c).strip().lower():
+                                qc_status_col = c
+                                break
+
+                        fc1, fc2, fc3, fc4 = st.columns([2, 1, 1, 1.6])
                         with fc1:
                             qc_display_mode = st.radio(
                                 "Show as", ["% within category", "Ticket counts"],
@@ -876,6 +886,31 @@ def main():
                                 format_func=lambda m: "All" if m == "All" else calendar.month_name[int(m)],
                                 key="qc_filter_month"
                             )
+
+                        with fc4:
+                            res_status_pick = st.selectbox(
+                                "Resolved ticket status",
+                                ["Closed", "Submit for Approval", "Closed + Submit for Approval"],
+                                key="qc_res_status",
+                                help="Which ticket statuses count towards the RESOLVED quality check "
+                                     "tables below. Raised tables are unaffected."
+                            )
+                        if qc_status_col is None:
+                            st.warning("⚠️ No status column found in the QC sheet, so the resolved "
+                                       "status filter cannot be applied.")
+
+                        def _ticket_status_mask(frame, choice):
+                            """Rows whose ticket status matches the chosen resolved scope."""
+                            if qc_status_col is None or frame.empty:
+                                return pd.Series(True, index=frame.index)
+                            s = frame[qc_status_col].astype(str).str.strip().str.lower()
+                            closed = s.str.contains('closed') | s.str.contains('complied') | s.eq('resolved')
+                            sfa = s.str.contains('submit') & s.str.contains('approval')
+                            if choice == 'Closed':
+                                return closed
+                            if choice == 'Submit for Approval':
+                                return sfa
+                            return closed | sfa
 
                         normalise = qc_display_mode.startswith("%")
 
@@ -900,13 +935,20 @@ def main():
                         qc_scopes = {
                             "Raised": [("L1 (Col R)", qc_cat, r_l1_col), ("L2 (Col S)", qc_cat, r_l2_col)],
                             "Resolved": [
-                                ("L1 (Col T)", qc_cat[_not_evaluated_mask(qc_cat, res_l1_col)], res_l1_col),
-                                ("L2 (Col U)", qc_cat[_not_evaluated_mask(qc_cat, res_l2_col)], res_l2_col),
+                                ("L1 (Col T)",
+                                 qc_cat[_not_evaluated_mask(qc_cat, res_l1_col)
+                                        & _ticket_status_mask(qc_cat, res_status_pick)], res_l1_col),
+                                ("L2 (Col U)",
+                                 qc_cat[_not_evaluated_mask(qc_cat, res_l2_col)
+                                        & _ticket_status_mask(qc_cat, res_status_pick)], res_l2_col),
                             ],
                         }
 
                         for scope_name, levels in qc_scopes.items():
-                            st.markdown(f"#### {'🚨' if scope_name == 'Raised' else '🏁'} {scope_name} Tickets by Category")
+                            heading = f"#### {'🚨' if scope_name == 'Raised' else '🏁'} {scope_name} Tickets by Category"
+                            if scope_name == 'Resolved':
+                                heading += f" - {res_status_pick}"
+                            st.markdown(heading)
                             lvl_cols = st.columns(2)
                             for lvl_idx, (lvl_label, frame, status_col) in enumerate(levels):
                                 with lvl_cols[lvl_idx]:
@@ -1050,7 +1092,8 @@ def main():
 
                         try:
                             qc_pdf_bytes = build_qc_pdf(qc_scopes_data, qc_report_date, qc_city_name,
-                                                        period_label=qc_pdf_period)
+                                                        period_label=qc_pdf_period,
+                                                        resolved_status_label=res_status_pick)
                             st.download_button(
                                 "📄 Download QC Report (PDF)",
                                 data=qc_pdf_bytes,
